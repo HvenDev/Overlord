@@ -720,14 +720,12 @@ export async function startBuildProcess(
 
     const serverConfig = getConfig();
     const buildAgentToken = (serverConfig.auth.agentToken || "").trim();
+	const serverConfig = getConfig();
+	const buildAgentToken = (serverConfig.auth.agentToken || "").trim();
 	const buildTlsSpkiPins: string[] = [];
-      throw new Error(
-        "TLS offload requires OVERLORD_TLS_SPKI_PINS before building agents; " +
-        "pin the external HTTPS/WSS certificate public key",
-      );
-    }
 
-    const rootDir = resolveRuntimeRoot();
+	const rootDir = resolveRuntimeRoot();
+	const outDir = path.join(rootDir, "dist-clients");
     const outDir = path.join(rootDir, "dist-clients");
 
     if (config.buildProvider) {
