@@ -1,0 +1,391 @@
+//go:build overlord_webrtc
+
+package webrtcpub
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"overlord-client/cmd/agent/internal/overlordenv"
+	agentTLS "overlord-client/cmd/agent/tlsconfig"
+
+	"github.com/pion/interceptor"
+	"github.com/pion/rtcp"
+	"github.com/pion/webrtc/v4"
+)
+
+func drainRTCP(sender *webrtc.RTPSender, kind Kind) {
+	buf := make([]byte, 1500)
+	for {
+		n, _, err := sender.Read(buf)
+		if err != nil {
+			return
+		}
+		packets, err := rtcp.Unmarshal(buf[:n])
+		if err != nil {
+			continue
+		}
+		for _, p := range packets {
+			switch p.(type) {
+			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+				if kind != "" {
+					handleRTCPKeyframeFeedback(kind)
+				}
+			}
+		}
+	}
+}
+
+const h264SDPFmtpLine = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d0034"
+
+var rtcpKeyframeLogOnce sync.Once
+var (
+	lastDesktopRTCPKeyframeRequest   atomic.Int64
+	lastBackstageRTCPKeyframeRequest atomic.Int64
+	lastWebcamRTCPKeyframeRequest    atomic.Int64
+)
+
+const rtcpKeyframeMinInterval = 750 * time.Millisecond
+
+func handleRTCPKeyframeFeedback(kind Kind) {
+	if !honorRTCPKeyframes() {
+		rtcpKeyframeLogOnce.Do(func() {
+			log.Printf("webrtcpub: RTCP video keyframe recovery disabled by OVERLORD_WEBRTC_RTCP_KEYFRAMES")
+		})
+		return
+	}
+	now := time.Now().UnixNano()
+	for {
+		last := rtcpKeyframeTimestamp(kind).Load()
+		if last > 0 && time.Duration(now-last) < rtcpKeyframeMinInterval {
+			return
+		}
+		if rtcpKeyframeTimestamp(kind).CompareAndSwap(last, now) {
+			break
+		}
+	}
+	RequestKeyframe(kind)
+}
+
+func rtcpKeyframeTimestamp(kind Kind) *atomic.Int64 {
+	switch kind {
+	case Kindbackstage:
+		return &lastBackstageRTCPKeyframeRequest
+	case KindWebcam:
+		return &lastWebcamRTCPKeyframeRequest
+	default:
+		return &lastDesktopRTCPKeyframeRequest
+	}
+}
+
+func honorRTCPKeyframes() bool {
+	switch strings.ToLower(strings.TrimSpace(overlordenv.Getenv("OVERLORD_WEBRTC_RTCP_KEYFRAMES"))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+type Publisher struct {
+	kind        Kind
+	pc          *webrtc.PeerConnection
+	resourceURL string
+	token       string
+	httpClient  *http.Client
+	closeOnce   sync.Once
+}
+
+var (
+	whipMu     sync.Mutex
+	whipByKind = map[Kind]*Publisher{}
+)
+
+func Start(ctx context.Context, kind Kind, opts Options) (*Publisher, error) {
+	ensureFirewallRule()
+	if strings.TrimSpace(opts.WhipURL) == "" {
+		return nil, errors.New("webrtcpub: empty WhipURL")
+	}
+	if strings.TrimSpace(opts.PublishToken) == "" {
+		return nil, errors.New("webrtcpub: empty PublishToken")
+	}
+	if !opts.HasVideo && !opts.HasAudio {
+		return nil, errors.New("webrtcpub: at least one of HasVideo/HasAudio must be true")
+	}
+	Stop(kind)
+
+	httpClient, err := buildHTTPClient(opts)
+	if err != nil {
+		return nil, fmt.Errorf("webrtcpub: invalid TLS configuration: %w", err)
+	}
+
+	mediaEngine := &webrtc.MediaEngine{}
+	if opts.HasVideo {
+		if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:    webrtc.MimeTypeH264,
+				ClockRate:   90000,
+				SDPFmtpLine: h264SDPFmtpLine,
+			},
+			PayloadType: 102,
+		}, webrtc.RTPCodecTypeVideo); err != nil {
+			return nil, fmt.Errorf("register video codec: %w", err)
+		}
+	}
+	if opts.HasAudio {
+		if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:    webrtc.MimeTypeOpus,
+				ClockRate:   48000,
+				Channels:    2,
+				SDPFmtpLine: "minptime=10;useinbandfec=1",
+			},
+			PayloadType: 111,
+		}, webrtc.RTPCodecTypeAudio); err != nil {
+			return nil, fmt.Errorf("register audio codec: %w", err)
+		}
+	}
+
+	interceptorRegistry := &interceptor.Registry{}
+	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, interceptorRegistry); err != nil {
+		return nil, fmt.Errorf("register WebRTC interceptors: %w", err)
+	}
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(mediaEngine),
+		webrtc.WithInterceptorRegistry(interceptorRegistry),
+	)
+	iceServers := make([]webrtc.ICEServer, 0, len(opts.ICEServers))
+	for _, server := range opts.ICEServers {
+		iceServers = append(iceServers, webrtc.ICEServer{
+			URLs:       server.URLs,
+			Username:   server.Username,
+			Credential: server.Credential,
+		})
+	}
+	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: iceServers})
+	if err != nil {
+		return nil, fmt.Errorf("new peer connection: %w", err)
+	}
+
+	var (
+		videoTrack  *webrtc.TrackLocalStaticRTP
+		audioTrack  *webrtc.TrackLocalStaticSample
+		audioWriter AudioWriter
+	)
+	if opts.HasVideo {
+		videoTrack, err = webrtc.NewTrackLocalStaticRTP(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264},
+			"overlord-video-"+string(kind), "overlord-"+string(kind),
+		)
+		if err != nil {
+			_ = pc.Close()
+			return nil, fmt.Errorf("new video track: %w", err)
+		}
+		tx, err := pc.AddTransceiverFromTrack(videoTrack, webrtc.RTPTransceiverInit{
+			Direction: webrtc.RTPTransceiverDirectionSendonly,
+		})
+		if err != nil {
+			_ = pc.Close()
+			return nil, fmt.Errorf("add video transceiver: %w", err)
+		}
+		if sender := tx.Sender(); sender != nil {
+			go drainRTCP(sender, kind)
+		}
+	}
+	if opts.HasAudio {
+		audioTrack, err = webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2, SDPFmtpLine: "minptime=10;useinbandfec=1"},
+			"overlord-audio-"+string(kind), "overlord-"+string(kind),
+		)
+		if err != nil {
+			_ = pc.Close()
+			return nil, fmt.Errorf("new audio track: %w", err)
+		}
+		audioWriter, err = newOpusAudioWriter(audioTrack)
+		if err != nil {
+			_ = pc.Close()
+			return nil, fmt.Errorf("new opus encoder: %w", err)
+		}
+		tx, err := pc.AddTransceiverFromTrack(audioTrack, webrtc.RTPTransceiverInit{
+			Direction: webrtc.RTPTransceiverDirectionSendonly,
+		})
+		if err != nil {
+			_ = pc.Close()
+			return nil, fmt.Errorf("add audio transceiver: %w", err)
+		}
+		if sender := tx.Sender(); sender != nil {
+			go drainRTCP(sender, "")
+		}
+	}
+
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		_ = pc.Close()
+		return nil, fmt.Errorf("create offer: %w", err)
+	}
+	gathered := webrtc.GatheringCompletePromise(pc)
+	if err := pc.SetLocalDescription(offer); err != nil {
+		_ = pc.Close()
+		return nil, fmt.Errorf("set local desc: %w", err)
+	}
+
+	select {
+	case <-gathered:
+	case <-time.After(5 * time.Second):
+		log.Printf("webrtcpub: ICE gathering timeout; continuing with partial candidates")
+	case <-ctx.Done():
+		_ = pc.Close()
+		return nil, ctx.Err()
+	}
+
+	answerSDP, resourceURL, err := postWhip(ctx, httpClient, opts.WhipURL, opts.PublishToken, pc.LocalDescription().SDP)
+	if err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer,
+		SDP:  answerSDP,
+	}); err != nil {
+		_ = pc.Close()
+		return nil, fmt.Errorf("set remote desc: %w", err)
+	}
+
+	pub := &Publisher{
+		kind:        kind,
+		pc:          pc,
+		resourceURL: resourceURL,
+		token:       opts.PublishToken,
+		httpClient:  httpClient,
+	}
+
+	writerID := whipWriterID(kind)
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("webrtcpub: WHIP[%s] peer state=%s", kind, state)
+		switch state {
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+			whipMu.Lock()
+			if whipByKind[kind] == pub {
+				delete(whipByKind, kind)
+			}
+			whipMu.Unlock()
+			unregisterWriter(kind, writerID)
+		}
+	})
+
+	whipMu.Lock()
+	whipByKind[kind] = pub
+	whipMu.Unlock()
+	if videoTrack != nil {
+		registerVideoWriter(kind, writerID, newH264TrackWriter(videoTrack))
+	}
+	if audioTrack != nil {
+		registerAudioWriter(kind, writerID, audioWriter)
+	}
+	log.Printf("webrtcpub: WHIP[%s] session established (resource=%s)", kind, resourceURL)
+	return pub, nil
+}
+
+func Stop(kind Kind) {
+	whipMu.Lock()
+	p := whipByKind[kind]
+	delete(whipByKind, kind)
+	whipMu.Unlock()
+	unregisterWriter(kind, whipWriterID(kind))
+	if p != nil {
+		p.Close()
+	}
+}
+
+func StopAll() {
+	whipMu.Lock()
+	kinds := make([]Kind, 0, len(whipByKind))
+	for k := range whipByKind {
+		kinds = append(kinds, k)
+	}
+	whipMu.Unlock()
+	for _, k := range kinds {
+		Stop(k)
+	}
+}
+
+func (p *Publisher) Close() {
+	p.closeOnce.Do(func() {
+		if p.resourceURL != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodDelete, p.resourceURL, nil)
+			if err == nil {
+				if p.token != "" {
+					req.Header.Set("Authorization", "Bearer "+p.token)
+				}
+				if resp, err := p.httpClient.Do(req); err == nil {
+					_ = resp.Body.Close()
+				}
+			}
+		}
+		_ = p.pc.Close()
+	})
+}
+
+func whipWriterID(kind Kind) string {
+	return "whip:" + string(kind)
+}
+
+func postWhip(ctx context.Context, client *http.Client, whipURL, token, sdp string) (string, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, whipURL, strings.NewReader(sdp))
+	if err != nil {
+		return "", "", fmt.Errorf("build whip request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/sdp")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("whip post: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode/100 != 2 {
+		return "", "", fmt.Errorf("whip post: %s: %s", resp.Status, bytes.TrimSpace(body))
+	}
+
+	resource := resp.Header.Get("Location")
+	if resource != "" {
+		if parsed, err := url.Parse(resource); err == nil && !parsed.IsAbs() {
+			base, _ := url.Parse(whipURL)
+			if base != nil {
+				resource = base.ResolveReference(parsed).String()
+			}
+		}
+	}
+	return string(body), resource, nil
+}
+
+func buildHTTPClient(opts Options) (*http.Client, error) {
+	tlsCfg, err := agentTLS.Build(agentTLS.Options{
+		InsecureSkipVerify: opts.TLSInsecureSkipVerify,
+		CAPath:             opts.TLSCAPath,
+		SPKIPins:           opts.TLSSPKIPins,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: tlsCfg,
+		},
+	}, nil
+}

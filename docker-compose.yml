@@ -1,0 +1,270 @@
+services:
+  overlord-server:
+    image: ${DOCKER_IMAGE:-ghcr.io/doesntbreaktos/overlord:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      cache_from:
+        - type=local,src=.docker-cache/buildx
+      cache_to:
+        - type=local,dest=.docker-cache/buildx,mode=max
+    container_name: overlord-server
+    user: "1000:1000"
+    read_only: true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777
+      - /app/Overlord-Client:rw,nosuid,nodev,size=128m,uid=1000,gid=1000,mode=0755
+    # Host networking: the container shares the host's network stack directly.
+    # Every port the server binds (5173, SOCKS5 proxies, etc.) is accessible
+    # on the host with zero overhead — no per-port proxy process.
+    network_mode: host
+    environment:
+      PORT: ${PORT:-5173}
+      HOST: ${HOST:-0.0.0.0}
+      # Optional: set an explicit initial admin account. If OVERLORD_PASS is empty,
+      # the server generates one-time bootstrap secrets and stores them in /app/data/save.json.
+      OVERLORD_USER: ${OVERLORD_USER:-admin}
+      OVERLORD_PASS: ${OVERLORD_PASS:-}
+      # Optional overrides. If empty, generated and persisted to /app/data/save.json.
+      JWT_SECRET: ${JWT_SECRET:-}
+      OVERLORD_AGENT_TOKEN: ${OVERLORD_AGENT_TOKEN:-}
+      NODE_ENV: ${NODE_ENV:-production}
+      OVERLORD_TLS_CERT: ${OVERLORD_TLS_CERT:-/app/certs/server.crt}
+      OVERLORD_TLS_KEY: ${OVERLORD_TLS_KEY:-/app/certs/server.key}
+      OVERLORD_TLS_CA: ${OVERLORD_TLS_CA:-}
+      OVERLORD_TLS_MIGRATE_LEGACY_CERT: ${OVERLORD_TLS_MIGRATE_LEGACY_CERT:-true}
+      # Required for generated-agent pinning when TLS is terminated by a proxy.
+      # May contain current,next pins during certificate key rotation.
+      OVERLORD_TLS_SPKI_PINS: ${OVERLORD_TLS_SPKI_PINS:-}
+      # Set true only behind a trusted reverse proxy that terminates TLS (for example Render).
+      # Default false keeps current behavior: Overlord terminates TLS in-process.
+      OVERLORD_TLS_OFFLOAD: ${OVERLORD_TLS_OFFLOAD:-false}
+      # Trust X-Forwarded-For / X-Real-IP / CF-Connecting-IP from an upstream proxy when
+      # resolving the agent's source IP shown in the dashboard, audit log, and IP bans.
+      # Set true only when a trusted reverse proxy (nginx, Caddy, Cloudflare, etc.) sits
+      # in front of Overlord — otherwise agents can spoof their IP. Auto-enabled when
+      # OVERLORD_TLS_OFFLOAD=true.
+      OVERLORD_TRUST_PROXY: ${OVERLORD_TRUST_PROXY:-false}
+      # Cookie security mode: auto (default), true, or false.
+      # auto: Secure cookie on HTTPS requests / X-Forwarded-Proto=https.
+      OVERLORD_AUTH_COOKIE_SECURE: ${OVERLORD_AUTH_COOKIE_SECURE:-auto}
+      # Optional certbot integration (used only when NODE_ENV=production)
+      OVERLORD_TLS_CERTBOT_ENABLED: ${OVERLORD_TLS_CERTBOT_ENABLED:-false}
+      OVERLORD_TLS_CERTBOT_LIVE_PATH: ${OVERLORD_TLS_CERTBOT_LIVE_PATH:-/etc/letsencrypt/live}
+      OVERLORD_TLS_CERTBOT_DOMAIN: ${OVERLORD_TLS_CERTBOT_DOMAIN:-}
+      OVERLORD_TLS_CERTBOT_CERT_FILE: ${OVERLORD_TLS_CERTBOT_CERT_FILE:-fullchain.pem}
+      OVERLORD_TLS_CERTBOT_KEY_FILE: ${OVERLORD_TLS_CERTBOT_KEY_FILE:-privkey.pem}
+      OVERLORD_TLS_CERTBOT_CA_FILE: ${OVERLORD_TLS_CERTBOT_CA_FILE:-chain.pem}
+      OVERLORD_CLIENT_BUILD_CACHE_DIR: ${OVERLORD_CLIENT_BUILD_CACHE_DIR:-/app/client-build-cache}
+      OVERLORD_FILE_UPLOAD_INTENT_TTL_MS: ${OVERLORD_FILE_UPLOAD_INTENT_TTL_MS:-1800000}
+      OVERLORD_FILE_UPLOAD_PULL_TTL_MS: ${OVERLORD_FILE_UPLOAD_PULL_TTL_MS:-1800000}
+      # WebRTC: where Bun reaches MediaMTX HTTP (WHIP/WHEP signaling).
+      # Host networking on Linux → localhost works. WebRTC is opt-in; leave the
+      # toggle in the UI off if MediaMTX is not running.
+      OVERLORD_MEDIAMTX_URL: ${OVERLORD_MEDIAMTX_URL:-http://localhost:8889}
+      OVERLORD_TURN_HOST: ${OVERLORD_TURN_HOST:-127.0.0.1}
+      OVERLORD_TURN_PORT: ${OVERLORD_TURN_PORT:-3478}
+      OVERLORD_TURN_SECRET_FILE: /run/overlord-turn/secret
+      OVERLORD_TURN_CREDENTIAL_TTL_SECONDS: ${OVERLORD_TURN_CREDENTIAL_TTL_SECONDS:-3600}
+    volumes:
+      # overlord-data also caches downloaded cross-compile toolchains
+      # under /app/data/toolchains, fetched on first agent build for a
+      # given target (mingw, aarch64/armv7/musl, Android NDK, ldid, UPX).
+      - overlord-data:/app/data
+      - overlord-certs:/app/certs
+      - overlord-client-build-cache:/app/client-build-cache
+      - overlord-plugins:/app/plugins
+      - overlord-dist-clients:/app/dist-clients
+      - overlord-turn-secret:/run/overlord-turn:ro
+      # Uncomment to mount host certbot certs read-only
+      # - /etc/letsencrypt:/etc/letsencrypt:ro
+      # Uncomment to use a static config file instead of env vars
+      # - ./Overlord-Server/config.json:/app/config.json:ro
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # Use http:// when OVERLORD_TLS_OFFLOAD=true.
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate ${OVERLORD_HEALTHCHECK_URL:-https://localhost:5173/health} >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      overlord-permissions-init:
+        condition: service_completed_successfully
+      turn-secret-init:
+        condition: service_completed_successfully
+
+  overlord-permissions-init:
+    image: ${DOCKER_IMAGE:-ghcr.io/doesntbreaktos/overlord:latest}
+    user: "0:0"
+    read_only: true
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        for dir in /app/data /app/certs /app/client-build-cache /app/plugins /app/dist-clients; do
+          marker="$$dir/.overlord-uid-1000"
+          if [ ! -e "$$marker" ]; then
+            chown -R 1000:1000 "$$dir"
+            touch "$$marker"
+            chown 1000:1000 "$$marker"
+          fi
+        done
+    volumes:
+      - overlord-data:/app/data
+      - overlord-certs:/app/certs
+      - overlord-client-build-cache:/app/client-build-cache
+      - overlord-plugins:/app/plugins
+      - overlord-dist-clients:/app/dist-clients
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  turn-secret-init:
+    image: alpine:3.22
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        if [ ! -s /run/overlord-turn/secret ]; then
+          head -c 32 /dev/urandom | base64 > /run/overlord-turn/secret
+        fi
+        case "$${OVERLORD_TURN_REALM:-}" in *[!A-Za-z0-9.-]*) echo "Invalid OVERLORD_TURN_REALM" >&2; exit 1;; esac
+        if [ "$${#OVERLORD_TURN_REALM}" -gt 253 ]; then echo "OVERLORD_TURN_REALM is too long" >&2; exit 1; fi
+        if [ -n "$${OVERLORD_TURN_REALM:-}" ]; then
+          printf '%s\n' "$${OVERLORD_TURN_REALM}" > /run/overlord-turn/realm
+        elif [ ! -s /run/overlord-turn/realm ]; then
+          realm_id="$$(head -c 32 /dev/urandom | sha256sum | cut -c1-24)"
+          printf 'r-%s.invalid\n' "$$realm_id" > /run/overlord-turn/realm
+        fi
+        IFS= read -r turn_secret < /run/overlord-turn/secret
+        printf 'webrtcICEServers2:\n  - url: "stun:%s:%s"\n  - url: "turn:%s:%s?transport=udp"\n    username: AUTH_SECRET\n    password: "%s"\n    clientOnly: true\n  - url: "turn:%s:%s?transport=tcp"\n    username: AUTH_SECRET\n    password: "%s"\n    clientOnly: true\n' "$${OVERLORD_TURN_HOST}" "$${OVERLORD_TURN_PORT}" "$${OVERLORD_TURN_HOST}" "$${OVERLORD_TURN_PORT}" "$$turn_secret" "$${OVERLORD_TURN_HOST}" "$${OVERLORD_TURN_PORT}" "$$turn_secret" > /run/overlord-turn/mediamtx.yml
+        chmod 0444 /run/overlord-turn/secret /run/overlord-turn/realm /run/overlord-turn/mediamtx.yml
+    environment:
+      OVERLORD_TURN_HOST: ${OVERLORD_TURN_HOST:-127.0.0.1}
+      OVERLORD_TURN_PORT: ${OVERLORD_TURN_PORT:-3478}
+      OVERLORD_TURN_REALM: ${OVERLORD_TURN_REALM:-}
+    volumes:
+      - overlord-turn-secret:/run/overlord-turn
+    restart: "no"
+
+  coturn:
+    image: coturn/coturn:4.14.0-r0-alpine
+    container_name: overlord-coturn
+    network_mode: host
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        secret="$$(cat /run/overlord-turn/secret)"
+        realm="$${OVERLORD_TURN_REALM:-$$(cat /run/overlord-turn/realm)}"
+        external=""
+        if [ -n "$${OVERLORD_TURN_EXTERNAL_IP:-}" ]; then external="--external-ip=$${OVERLORD_TURN_EXTERNAL_IP}"; fi
+        exec turnserver --fingerprint --use-auth-secret --static-auth-secret="$$secret" --realm="$$realm" --listening-port=3478 --min-port=49160 --max-port=49200 --no-tls --no-dtls --no-multicast-peers --log-file=stdout $$external
+    environment:
+      OVERLORD_TURN_REALM: ${OVERLORD_TURN_REALM:-}
+      OVERLORD_TURN_EXTERNAL_IP: ${OVERLORD_TURN_EXTERNAL_IP:-}
+    volumes:
+      - overlord-turn-secret:/run/overlord-turn:ro
+    depends_on:
+      turn-secret-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  mediamtx:
+    image: bluenviron/mediamtx:1.19.2
+    user: "65534:65534"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777
+    container_name: overlord-mediamtx
+    # Share the host network so WebRTC ICE candidates use the host's real
+    # interfaces directly — no extra config needed for local or LAN browsers.
+    network_mode: host
+    command: ["/run/overlord-turn/mediamtx.yml"]
+    volumes:
+      - overlord-turn-secret:/run/overlord-turn:ro
+    depends_on:
+      turn-secret-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    environment:
+      # Disable every protocol except WebRTC. The Overlord server proxies all
+      # WHIP/WHEP signaling and enforces auth itself, so MediaMTX doesn't
+      # need RTSP/RTMP/HLS/SRT listeners.
+      MTX_RTSP: "no"
+      MTX_RTMP: "no"
+      MTX_HLS: "no"
+      MTX_SRT: "no"
+      MTX_MOQ: "no"
+      # Signaling is proxied by Overlord and must not be reachable publicly.
+      MTX_WEBRTCADDRESS: "127.0.0.1:8889"
+      # ICE on fixed ports so the compose / host firewall has a single target.
+      MTX_WEBRTCLOCALUDPADDRESS: ":8189"
+      MTX_WEBRTCLOCALTCPADDRESS: ":8189"
+      # Keep the real-time packet queue bounded and use an MTU that remains
+      # safe across common VPN, IPv6, and tunneled network paths.
+      MTX_WRITEQUEUESIZE: ${OVERLORD_MEDIAMTX_WRITE_QUEUE_SIZE:-128}
+      MTX_UDPMAXPAYLOADSIZE: ${OVERLORD_MEDIAMTX_UDP_MAX_PAYLOAD_SIZE:-1200}
+      # Leave blank to let MediaMTX advertise detected interfaces. Public-NAT
+      # deployments must set this to their public IP/DNS; LAN deployments can
+      # include both LAN and public addresses, for example:
+      #   OVERLORD_WEBRTC_ADDITIONAL_HOSTS=192.168.1.42,stream.example.com
+      MTX_WEBRTCADDITIONALHOSTS: ${OVERLORD_WEBRTC_ADDITIONAL_HOSTS:-}
+
+  # Optional private VPN access with Tailscale.
+  #
+  # This joins the host network to your tailnet so Overlord can be reached at
+  # the Tailscale IP on port 5173. It does NOT close the public port by itself:
+  # also bind Overlord to the Tailscale IP or use the host firewall to deny
+  # public access to 5173 while allowing the tailscale0 interface.
+  #
+  # Before enabling:
+  #   1. Create a tagged, preauthorized Tailscale auth key (prefer one-off;
+  #      the persistent state volume avoids needing it again after restarts).
+  #   2. Set TS_AUTHKEY in .env (never commit the key).
+  #   3. Uncomment this service and the tailscale-state volume below.
+  #   4. Apply a tailnet ACL/grant that limits who can reach TCP 5173.
+  #
+  # tailscale:
+  #   image: tailscale/tailscale:stable
+  #   container_name: overlord-tailscale
+  #   hostname: ${TS_HOSTNAME:-overlord-server}
+  #   network_mode: host
+  #   environment:
+  #     TS_AUTHKEY: ${TS_AUTHKEY:?set TS_AUTHKEY before enabling Tailscale}
+  #     TS_STATE_DIR: /var/lib/tailscale
+  #     TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:---accept-dns=false --advertise-tags=tag:overlord}
+  #   volumes:
+  #     - tailscale-state:/var/lib/tailscale
+  #   devices:
+  #     - /dev/net/tun:/dev/net/tun
+  #   cap_add:
+  #     - NET_ADMIN
+  #     - SYS_MODULE
+  #   restart: unless-stopped
+  #   security_opt:
+  #     - no-new-privileges:true
+
+volumes:
+  overlord-data:
+  overlord-certs:
+  overlord-client-build-cache:
+  overlord-plugins:
+  overlord-dist-clients:
+  overlord-turn-secret:
+  # tailscale-state:

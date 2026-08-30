@@ -1,0 +1,65 @@
+# Node/Bun (match at any depth — Overlord-Server/node_modules etc.)
+**/node_modules/
+**/.next/
+**/.cache/
+**/dist/
+**/.tmp/
+
+# Database
+**/*.db
+**/*.db-journal
+
+# Configuration (contains secrets)
+**/config.json
+
+# Environment files are local/dev-only and must never enter an image build context.
+**/.env*
+
+# Certificates
+**/certs/
+**/*.crt
+**/*.key
+**/*.pem
+**/*.csr
+
+# Runtime data / uploads / plugins (mounted as volumes at runtime)
+Overlord-Server/data/
+Overlord-Server/uploads/
+Overlord-Server/plugins/
+plugins/
+
+# OS
+.DS_Store
+Thumbs.db
+.idea
+.vscode
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# CI metadata is not needed in container build contexts
+.github/
+.gitlab/
+.gitlab-ci.yml
+
+# Build outputs (agent binaries are large; exclude them but keep pre-built DLLs)
+**/dist-clients/*.exe
+**/dist-clients/*.pdb
+**/dist-clients/*.lib
+**/dist-clients/*.exp
+Overlord-Client/build/
+release/
+
+# Local docker buildx cache (host-only)
+.docker-cache/
+
+**/*.tsbuildinfo
+**/coverage/
+**/tmp/
+**/temp/
+
+# Logs
+**/*.log
+**/logs/

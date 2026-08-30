@@ -1,0 +1,788 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script src="/assets/nav-prelude.js"></script>
+    <link rel="modulepreload" href="/assets/nav.js" />
+    <title>Overlord Remote Desktop</title>
+    <link rel="icon" type="image/x-icon" href="/assets/favicon.ico" />
+    <link rel="stylesheet" href="/vendor/inter/400.css" />
+    <link rel="stylesheet" href="/vendor/inter/600.css" />
+    <link rel="stylesheet" href="/vendor/inter/700.css" />
+<link rel="stylesheet" href="/assets/tailwind.css" />
+    <link rel="stylesheet" href="/vendor/fontawesome/css/all.min.css" />
+    <link rel="stylesheet" href="/assets/main.css" />
+    <link rel="stylesheet" href="/assets/custom.css" />
+    <link rel="stylesheet" href="/assets/console.css" />
+    <script defer src="/assets/logout.js"></script>
+  </head>
+  <body class="min-h-screen bg-slate-950 text-slate-100">
+    <header id="top-nav"></header>
+
+    <main class="px-5 py-6 flex-1 flex flex-col">
+      <div class="flex-1 flex flex-col gap-4" style="max-width: 100%">
+        <div class="flex flex-wrap gap-2 items-center">
+          <div class="flex items-center gap-2">
+            <button id="startBtn" class="button primary">
+              <i class="fa-solid fa-play"></i><span>Start</span>
+            </button>
+            <button id="stopBtn" class="button ghost">
+              <i class="fa-solid fa-stop"></i><span>Stop</span>
+            </button>
+            <button id="recordBtn" class="button ghost" disabled title="Record on the server using Canvas transport">
+              <i class="fa-solid fa-circle-dot"></i><span>Record</span>
+            </button>
+            <div class="relative" id="rdRecordingSettingsWrap">
+              <button
+                id="rdRecordingSettingsBtn"
+                type="button"
+                class="button ghost"
+                aria-haspopup="true"
+                aria-expanded="false"
+              >
+                <i class="fa-solid fa-sliders"></i><span>Recording Settings</span>
+                <i class="fa-solid fa-chevron-down text-[10px] text-slate-400 ml-1"></i>
+              </button>
+
+              <div
+                id="rdRecordingSettingsMenu"
+                class="hidden absolute left-0 top-full mt-2 w-[280px] rounded-xl border border-slate-700 bg-slate-900/95 backdrop-blur-md shadow-2xl shadow-black/50 z-50"
+                role="menu"
+              >
+                <div class="px-4 py-3">
+                  <div class="text-xs uppercase tracking-wide text-slate-500 mb-2">Recording</div>
+                  <div class="flex items-center gap-2 mb-2">
+                    <label class="text-sm text-slate-300 w-16" for="recordMode">Mode</label>
+                    <select
+                      id="recordMode"
+                      class="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm text-slate-100"
+                      title="Recording size mode"
+                    >
+                      <option value="normal">Normal</option>
+                      <option value="compact">Compact</option>
+                    </select>
+                  </div>
+                  <div class="flex items-center gap-2">
+                    <label class="text-sm text-slate-300 w-16" for="recordFps">FPS</label>
+                    <select
+                      id="recordFps"
+                      class="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm text-slate-100"
+                      title="Recording frame rate"
+                    >
+                      <option value="">Source FPS</option>
+                      <option value="3">3 fps</option>
+                      <option value="5">5 fps</option>
+                      <option value="10">10 fps</option>
+                      <option value="15">15 fps</option>
+                      <option value="30">30 fps</option>
+                      <option value="60">60 fps</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <button id="fullscreenBtn" class="button ghost">
+              <i class="fa-solid fa-expand"></i><span>Fullscreen</span>
+            </button>
+          </div>
+
+          <div
+            id="streamStatus"
+            class="inline-flex items-center gap-2 px-3 py-2 rounded-full bg-slate-800 text-slate-300 border border-slate-700 text-sm"
+          >
+            <i class="fa-solid fa-circle-notch fa-spin"></i>
+            <span>Connecting</span>
+          </div>
+
+          <div
+            class="flex items-center gap-2 bg-slate-900/70 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-300"
+          >
+            <span class="uppercase tracking-wide text-xs text-slate-500">fps</span>
+            <span id="agentFps" class="pill pill-ghost font-mono text-emerald-200">--</span>
+            <span class="text-slate-600">→</span>
+            <span id="viewerFps" class="pill pill-ghost font-mono text-sky-200">--</span>
+          </div>
+          <div
+            class="flex items-center gap-2 bg-slate-900/70 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-300"
+          >
+            <span class="uppercase tracking-wide text-xs text-slate-500">input</span>
+            <span id="inputLatency" class="pill pill-ghost font-mono text-amber-200">-- ms</span>
+          </div>
+          <div
+            class="flex items-center gap-2 bg-slate-900/70 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-300"
+            title="WebRTC receive bitrate, network RTT, packet loss, and selected route"
+          >
+            <span class="uppercase tracking-wide text-xs text-slate-500">net</span>
+            <span id="networkStats" class="pill pill-ghost font-mono text-cyan-200">--</span>
+          </div>
+
+          <button id="diagnosticsBtn" type="button" class="button ghost" aria-pressed="false" title="Show streaming diagnostics HUD">
+            <i class="fa-solid fa-gauge-high"></i><span>Stats HUD</span>
+          </button>
+
+          <div class="relative ml-auto" id="rdSettingsWrap">
+            <button
+              id="rdSettingsBtn"
+              type="button"
+              class="button ghost"
+              aria-haspopup="true"
+              aria-expanded="false"
+            >
+              <i class="fa-solid fa-sliders"></i><span>Settings</span>
+              <i class="fa-solid fa-chevron-down text-[10px] text-slate-400 ml-1"></i>
+            </button>
+
+            <div
+              id="rdSettingsMenu"
+              class="hidden absolute right-0 top-full mt-2 w-[360px] max-h-[75vh] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900/95 backdrop-blur-md shadow-2xl shadow-black/50 z-50"
+              role="menu"
+            >
+              <div class="px-4 py-3 border-b border-slate-800">
+                <div class="text-xs uppercase tracking-wide text-slate-500 mb-2">Display</div>
+                <div class="flex items-center gap-2 mb-2">
+                  <label class="text-sm text-slate-300 w-20" for="displaySelect">Monitor</label>
+                  <select
+                    id="displaySelect"
+                    class="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm text-slate-100"
+                  ></select>
+                  <button id="refreshDisplays" class="button ghost" title="Refresh display list">
+                    <i class="fa-solid fa-rotate"></i>
+                  </button>
+                </div>
+              </div>
+
+              <div class="px-4 py-3 border-b border-slate-800">
+                <div class="text-xs uppercase tracking-wide text-slate-500 mb-2">Video</div>
+                <div class="flex items-center gap-2 mb-2">
+                  <label class="text-sm text-slate-300 w-20" for="qualitySlider">Quality</label>
+                  <input
+                    id="qualitySlider"
+                    type="range"
+                    min="10"
+                    max="100"
+                    step="5"
+                    value="90"
+                    class="flex-1 accent-emerald-400"
+                  />
+                  <span id="qualityValue" class="pill pill-ghost text-slate-100 text-xs min-w-[44px] text-center">95%</span>
+                </div>
+                <div class="flex items-center gap-2 mb-2">
+                  <label class="text-sm text-slate-300 w-20" for="webrtcMode">Transport</label>
+                  <select id="webrtcMode" class="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm text-slate-100" title="Streaming transport. P2P: browser ↔ agent direct, server only relays signaling. Relayed: through MediaMTX (works behind tougher NATs).">
+                    <option value="off" selected>Canvas</option>
+                    <option value="p2p">WebRTC P2P</option>
+                    <option value="relayed">WebRTC Relayed</option>
+                  </select>
+                </div>
+                <div class="flex items-center gap-2 mb-2">
+                  <label class="text-sm text-slate-300 w-20" for="streamProfileSelect">Profile</label>
+                  <select
+                    id="streamProfileSelect"
+                    class="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm text-slate-100"
+                    title="Auto starts with the best supported resolution and adapts to WebRTC network conditions"
+                  >
+                    <option value="auto" selected>Auto (best)</option>
+                    <option value="720:30">30 FPS - 720p</option>
+                    <option value="720:60">60 FPS - 720p</option>
+                    <option value="1080:30">30 FPS - 1080p</option>
+                    <option value="1080:60">60 FPS - 1080p</option>
+                    <option value="1440:30">30 FPS - 1440p</option>
+                    <option value="1440:60">60 FPS - 1440p</option>
+                    <option value="2160:30">30 FPS - 2160p (4K)</option>
+                    <option value="2160:60">60 FPS - 2160p (4K)</option>
+                  </select>
+                </div>
+                <div id="streamProfileDetail" class="mb-2 text-xs text-slate-500">Checking hardware encoder profiles…</div>
+                <div class="flex items-center gap-2 mb-2">
+                  <label class="text-sm text-slate-300 w-20" for="bitrateSelect">Bitrate</label>
+                  <select id="bitrateSelect" class="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm text-slate-100" title="Auto adapts bitrate from receiver feedback when the stream profile is also Auto">
+                    <option value="0" selected>Auto</option>
+                    <option value="5">5 Mbps</option>
+                    <option value="10">10 Mbps</option>
+                    <option value="15">15 Mbps</option>
+                    <option value="20">20 Mbps</option>
+                    <option value="30">30 Mbps</option>
+                    <option value="40">40 Mbps</option>
+                    <option value="50">50 Mbps</option>
+                  </select>
+                </div>
+                <div class="flex items-center justify-between gap-2">
+                  <label class="flex items-center gap-2 text-sm text-slate-200" title="Prefer HEVC or H.264 when available; disable to force JPEG">
+                    <input type="checkbox" id="codecH264" checked /> Efficient video (HEVC/H.264)
+                  </label>
+                  <span id="codecMode" class="pill pill-ghost text-slate-100 text-xs">Codec: auto</span>
+                </div>
+                <label class="mt-2 flex items-center gap-2 text-sm text-slate-200" title="Skip NVENC/direct GPU H.264 and use the software H.264 fallback path">
+                  <input type="checkbox" id="softwareH264Ctrl" /> Software H.264
+                </label>
+                <label class="mt-2 flex items-center gap-2 text-sm text-slate-200" title="Use GPU desktop duplication (Windows only)">
+                  <input type="checkbox" id="duplicationCtrl" /> GPU Capture
+                </label>
+                <button
+                  id="requestKeyframeBtn"
+                  type="button"
+                  class="button ghost w-full justify-center mt-3"
+                  title="Request a fresh video keyframe from the remote client"
+                  disabled
+                >
+                  <i class="fa-solid fa-film"></i><span>Request Keyframe</span>
+                </button>
+              </div>
+
+              <div class="px-4 py-3 border-b border-slate-800">
+                <div class="text-xs uppercase tracking-wide text-slate-500 mb-2">Audio</div>
+                <label class="flex items-center gap-2 text-sm text-slate-200 mb-2" title="Stream system audio from the remote machine">
+                  <input type="checkbox" id="audioCtrl" />
+                  <i class="fa-solid fa-volume-high text-slate-400"></i>
+                  <span>Enable audio</span>
+                </label>
+                <div class="flex items-center gap-2">
+                  <label class="text-sm text-slate-300 w-20" for="audioTransport">Via</label>
+                  <select id="audioTransport" class="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm text-slate-100" title="Audio transport. WS uses raw PCM over the existing WebSocket. WebRTC modes use full-band Opus.">
+                    <option value="off" selected>WS</option>
+                    <option value="p2p">WebRTC P2P</option>
+                    <option value="relayed">WebRTC Relayed</option>
+                  </select>
+                </div>
+                <audio id="webrtcAudio" autoplay style="display: none"></audio>
+              </div>
+
+              <div class="px-4 py-3 border-b border-slate-800">
+                <div class="text-xs uppercase tracking-wide text-slate-500 mb-2">Input &amp; Capture</div>
+                <div class="grid grid-cols-2 gap-x-3 gap-y-2 mb-3">
+                  <label class="flex items-center gap-2 text-sm text-slate-200">
+                    <input type="checkbox" id="mouseCtrl" /> Mouse
+                  </label>
+                  <label class="flex items-center gap-2 text-sm text-slate-200">
+                    <input type="checkbox" id="kbdCtrl" /> Keyboard
+                  </label>
+                  <label class="flex items-center gap-2 text-sm text-slate-200" title="Show the remote cursor without compositing it into captured frames">
+                    <input type="checkbox" id="cursorCtrl" /> Cursor
+                  </label>
+                  <label class="flex items-center gap-2 text-sm text-slate-200" title="Hide your browser cursor over the remote desktop">
+                    <input type="checkbox" id="hideLocalCursorCtrl" /> Hide Local Cursor
+                  </label>
+                  <label class="flex items-center gap-2 text-sm text-slate-200 col-span-2" title="Sync clipboard between your browser and the remote machine">
+                    <input type="checkbox" id="clipboardSyncCtrl" /> Clipboard Sync
+                  </label>
+                  <label class="flex items-center gap-2 text-sm text-red-400 col-span-2" title="Blacks out local screen and blocks physical input. Remote view remains unaffected. Local escape: Ctrl+P">
+                    <input type="checkbox" id="privacyCtrl" /> Privacy Mode
+                  </label>
+                </div>
+                <div class="mb-3 rounded-lg border border-slate-700 bg-slate-900/60 p-2" aria-labelledby="clipboardActionsLabel">
+                  <div id="clipboardActionsLabel" class="text-xs uppercase tracking-wide text-slate-500 mb-2">Clipboard</div>
+                  <textarea id="clipboardText" rows="2" maxlength="65536" readonly class="w-full resize-y rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100" placeholder="Clipboard preview"></textarea>
+                  <div class="grid grid-cols-2 gap-2 mt-2">
+                    <button id="clipboardFromUserBtn" type="button" class="rounded bg-slate-700 hover:bg-slate-600 px-2 py-1.5 text-xs text-slate-100" title="Bring the remote user's clipboard down to this browser"><i class="fa-solid fa-arrow-down mr-1"></i>Copy from user</button>
+                    <button id="clipboardToUserBtn" type="button" class="rounded bg-emerald-700 hover:bg-emerald-600 px-2 py-1.5 text-xs text-white" title="Send this browser's clipboard up to the remote user"><i class="fa-solid fa-arrow-up mr-1"></i>Copy to user</button>
+                  </div>
+                  <div id="clipboardStatus" class="mt-1 min-h-[1rem] text-[11px] text-slate-500" aria-live="polite"></div>
+                </div>
+                <div class="flex items-center gap-2" title="Smooths mouse input for steadier movement">
+                  <label class="text-sm text-slate-300 w-20" for="smoothingSlider">Smoothing</label>
+                  <input id="smoothingSlider" type="range" min="0" max="80" step="5" value="0" class="flex-1 accent-emerald-400" />
+                  <span id="smoothingValue" class="pill pill-ghost text-slate-100 text-xs min-w-[44px] text-center">0%</span>
+                </div>
+              </div>
+
+            </div>
+          </div>
+        </div>
+
+        <div
+          id="canvasContainer"
+          class="flex-1 rounded-xl border border-slate-800 bg-slate-900/70 shadow-lg overflow-hidden flex flex-col"
+          style="min-height: 500px"
+        >
+          <div class="rd-session-header p-3 text-sm text-slate-400 flex-shrink-0">
+            Client: <span id="clientLabel" class="text-slate-100">-</span>
+          </div>
+          <div
+            id="renderSurface"
+            class="relative flex-1 flex items-center justify-center p-4"
+            style="min-height: 0; overflow: hidden"
+          >
+            <button id="fullscreenExitBtn" type="button" class="rd-fullscreen-exit" aria-hidden="true" title="Exit fullscreen">
+              <i class="fa-solid fa-compress"></i><span>Exit fullscreen</span>
+            </button>
+            <div id="fullscreenHud" class="rd-fullscreen-hud" aria-hidden="true">
+              <div class="rd-hud-status">
+                <span id="fsHudStateDot" class="rd-hud-state-dot" aria-hidden="true"></span>
+                <span id="fsHudStatus">Connecting</span>
+              </div>
+              <div class="rd-hud-metrics" aria-label="Stream metrics">
+                <span id="fsHudResolution">--</span>
+                <span id="fsHudCodec">--</span>
+                <span id="fsHudFps">-- → -- FPS</span>
+                <span id="fsHudLatency">-- ms input</span>
+                <span id="fsHudNetwork">--</span>
+              </div>
+              <div class="rd-hud-actions">
+                <button id="fsHudTuckBtn" type="button" title="Tuck away fullscreen stats">
+                  <i class="fa-solid fa-chevron-down"></i><span>Hide</span>
+                </button>
+                <button id="fsHudStatsBtn" type="button" title="Show streaming diagnostics">
+                  <i class="fa-solid fa-gauge-high"></i><span>Stats</span>
+                </button>
+                <button id="fsHudExitBtn" type="button" title="Exit fullscreen">
+                  <i class="fa-solid fa-compress"></i><span>Exit</span>
+                </button>
+              </div>
+            </div>
+            <canvas
+              id="frameCanvas"
+              class="bg-slate-950"
+              width="1280"
+              height="720"
+              style="
+                display: block;
+                max-width: 100%;
+                max-height: 100%;
+                width: auto;
+                height: auto;
+              "
+            ></canvas>
+            <video
+              id="webrtcVideo"
+              class="bg-slate-950"
+              autoplay
+              playsinline
+              muted
+              style="
+                display: none;
+                max-width: 100%;
+                max-height: 100%;
+                width: auto;
+                height: auto;
+              "
+            ></video>
+            <div id="rdFileDropOverlay" class="rd-file-drop-overlay" hidden aria-hidden="true">
+              <div id="rdFileDragGhost" class="rd-file-drag-ghost">
+                <i class="fa-solid fa-file-arrow-up"></i>
+                <span id="rdFileDragLabel">Copy file</span>
+              </div>
+              <div class="rd-file-drop-hint">
+                <i class="fa-solid fa-copy"></i>
+                <strong>Drop at the remote pointer</strong>
+                <span>Folders receive the file; Desktop drops keep this position</span>
+              </div>
+            </div>
+            <div id="rdUploadStatus" class="rd-upload-status" hidden role="status" aria-live="polite">
+              <div class="rd-upload-status-row">
+                <i id="rdUploadStatusIcon" class="fa-solid fa-cloud-arrow-up"></i>
+                <span id="rdUploadStatusText">Preparing upload…</span>
+              </div>
+              <div class="rd-upload-progress"><div id="rdUploadProgressBar"></div></div>
+            </div>
+            <div id="remoteCursor" hidden aria-hidden="true" class="absolute pointer-events-none" style="left: 0; top: 0; z-index: 30; will-change: transform">
+              <img id="remoteCursorImage" alt="" draggable="false" style="display: block; width: 100%; height: 100%" />
+            </div>
+            <section id="rdStateOverlay" class="rd-state-overlay" hidden aria-live="polite">
+              <div class="rd-state-card">
+                <i id="rdStateIcon" class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i>
+                <div>
+                  <div id="rdStateTitle" class="rd-state-title">Connecting</div>
+                  <div id="rdStateDetail" class="rd-state-detail">Waiting for stream status…</div>
+                </div>
+                <div class="rd-state-actions">
+                  <button id="rdStateKeyframeBtn" type="button">Request keyframe</button>
+                  <button id="rdStateRestartBtn" type="button">Restart stream</button>
+                  <button id="rdStateTransportBtn" type="button">Switch transport</button>
+                </div>
+              </div>
+            </section>
+            <section id="diagnosticsHud" class="rd-diagnostics-hud hidden" aria-label="Streaming diagnostics">
+              <div class="rd-diagnostics-header">
+                <div>
+                  <div class="rd-diagnostics-title">Streaming diagnostics</div>
+                  <div id="diagSummary" class="rd-diagnostics-summary">Waiting for frames</div>
+                </div>
+                <button id="diagnosticsClose" type="button" class="rd-diagnostics-close" aria-label="Close diagnostics">×</button>
+              </div>
+              <div class="rd-diagnostics-meta">
+                <span id="diagTransport">Canvas</span>
+                <span id="diagCodec">--</span>
+                <span id="diagResolution">--</span>
+              </div>
+              <div class="rd-diagnostics-section">
+                <div class="rd-diagnostics-section-title">Agent pipeline</div>
+                <div class="rd-diagnostics-grid">
+                  <span>Capture</span><strong id="diagCapture">-- ms</strong>
+                  <span>Encode</span><strong id="diagEncode">-- ms</strong>
+                  <span>Packet/write</span><strong id="diagSend">-- ms</strong>
+                  <span>Agent total</span><strong id="diagAgentTotal">-- ms</strong>
+                </div>
+              </div>
+              <div class="rd-diagnostics-section">
+                <div class="rd-diagnostics-section-title">Transport</div>
+                <div class="rd-diagnostics-grid">
+                  <span>Receive rate</span><strong id="diagBitrate">-- Mbps</strong>
+                  <span>Network RTT</span><strong id="diagRtt">-- ms</strong>
+                  <span>Loss / jitter</span><strong id="diagLossJitter">--</strong>
+                  <span>Jitter buffer</span><strong id="diagJitterBuffer">-- ms</strong>
+                </div>
+              </div>
+              <div class="rd-diagnostics-section">
+                <div class="rd-diagnostics-section-title">Viewer pipeline</div>
+                <div class="rd-diagnostics-grid">
+                  <span>Decode latency</span><strong id="diagDecode">-- ms</strong>
+                  <span>Receive → render</span><strong id="diagRender">-- ms</strong>
+                  <span>Decode queue</span><strong id="diagQueue">0</strong>
+                  <span>Dropped / coalesced</span><strong id="diagDropped">0 / 0</strong>
+                  <span>FPS agent → viewer</span><strong id="diagFps">-- → --</strong>
+                  <span>Input RTT</span><strong id="diagInput">-- ms</strong>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+        <style>
+          body {
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+          }
+          #canvasContainer[data-stream-state="streaming"] {
+            border-color: rgba(16, 185, 129, 0.7);
+            box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.45);
+          }
+          #canvasContainer[data-stream-state="stalled"] {
+            border-color: rgba(251, 146, 60, 0.7);
+            box-shadow: 0 0 0 1px rgba(251, 146, 60, 0.45);
+          }
+          #recordBtn.recording {
+            background: rgba(190, 18, 60, 0.9);
+            border-color: rgba(244, 63, 94, 0.85);
+            color: #fff;
+          }
+          #canvasContainer:fullscreen {
+            display: flex;
+            flex-direction: column;
+            background: #000;
+            border: 0 !important;
+            border-radius: 0 !important;
+            box-shadow: none !important;
+            outline: none;
+          }
+          #canvasContainer:fullscreen .rd-session-header {
+            display: none;
+          }
+          #canvasContainer:fullscreen #renderSurface {
+            flex: 1 1 auto;
+            width: 100%;
+            height: 100%;
+            padding: 0 !important;
+          }
+          #canvasContainer:fullscreen #frameCanvas,
+          #canvasContainer:fullscreen #webrtcVideo {
+            width: 100% !important;
+            height: 100% !important;
+            max-width: none !important;
+            max-height: none !important;
+            object-fit: contain;
+            margin: auto;
+          }
+          .rd-fullscreen-exit {
+            display: none;
+            position: absolute;
+            top: 1rem;
+            right: 1rem;
+            z-index: 40;
+            align-items: center;
+            gap: 0.45rem;
+            padding: 0.55rem 0.75rem;
+            border: 1px solid rgba(148, 163, 184, 0.45);
+            border-radius: 999px;
+            color: #e2e8f0;
+            background: rgba(2, 6, 23, 0.72);
+            box-shadow: 0 14px 32px rgba(0, 0, 0, 0.35);
+            backdrop-filter: blur(10px);
+          }
+          .rd-fullscreen-exit:hover,
+          .rd-fullscreen-exit:focus-visible {
+            border-color: rgba(226, 232, 240, 0.7);
+            background: rgba(15, 23, 42, 0.9);
+          }
+          #canvasContainer:fullscreen .rd-fullscreen-exit {
+            display: inline-flex;
+          }
+          .rd-fullscreen-hud {
+            display: none;
+            position: absolute;
+            left: 50%;
+            bottom: 1rem;
+            z-index: 35;
+            width: min(920px, calc(100% - 2rem));
+            transform: translateX(-50%) translateY(10px);
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.75rem;
+            padding: 0.7rem 0.85rem;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 999px;
+            color: #e2e8f0;
+            background: rgba(2, 6, 23, 0.76);
+            box-shadow: 0 20px 48px rgba(0, 0, 0, 0.45);
+            backdrop-filter: blur(14px);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 160ms ease, transform 160ms ease;
+          }
+          #canvasContainer:fullscreen .rd-fullscreen-hud {
+            display: flex;
+          }
+          #canvasContainer:fullscreen .rd-fullscreen-hud.is-visible {
+            opacity: 1;
+            pointer-events: auto;
+            transform: translateX(-50%) translateY(0);
+          }
+          #canvasContainer:fullscreen .rd-fullscreen-hud.is-tucked {
+            left: 1rem;
+            right: auto;
+            bottom: 1rem;
+            width: auto;
+            transform: translateY(0);
+            padding: 0.55rem 0.65rem;
+          }
+          #canvasContainer:fullscreen .rd-fullscreen-hud.is-tucked .rd-hud-metrics,
+          #canvasContainer:fullscreen .rd-fullscreen-hud.is-tucked .rd-hud-actions button:not(#fsHudTuckBtn) {
+            display: none;
+          }
+          .rd-hud-status,
+          .rd-hud-metrics,
+          .rd-hud-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.55rem;
+          }
+          .rd-hud-status {
+            min-width: max-content;
+            font-weight: 700;
+          }
+          .rd-hud-state-dot {
+            width: 0.6rem;
+            height: 0.6rem;
+            border-radius: 999px;
+            background: #94a3b8;
+            box-shadow: 0 0 0 4px rgba(148, 163, 184, 0.14);
+          }
+          .rd-hud-state-dot[data-state="streaming"] {
+            background: #22c55e;
+            box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.14);
+          }
+          .rd-hud-state-dot[data-state="stalled"],
+          .rd-hud-state-dot[data-state="starting"],
+          .rd-hud-state-dot[data-state="stopping"],
+          .rd-hud-state-dot[data-state="connecting"] {
+            background: #f59e0b;
+            box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.16);
+          }
+          .rd-hud-state-dot[data-state="offline"],
+          .rd-hud-state-dot[data-state="disconnected"],
+          .rd-hud-state-dot[data-state="error"] {
+            background: #fb7185;
+            box-shadow: 0 0 0 4px rgba(251, 113, 133, 0.16);
+          }
+          .rd-hud-metrics {
+            min-width: 0;
+            justify-content: center;
+            flex: 1;
+            color: #cbd5e1;
+            font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          }
+          .rd-hud-metrics span {
+            padding: 0.22rem 0.45rem;
+            border-radius: 999px;
+            background: rgba(15, 23, 42, 0.72);
+            white-space: nowrap;
+          }
+          .rd-hud-actions button,
+          .rd-state-actions button {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 999px;
+            color: #e2e8f0;
+            background: rgba(15, 23, 42, 0.8);
+            padding: 0.42rem 0.62rem;
+            font-size: 0.78rem;
+          }
+          .rd-hud-actions button:hover,
+          .rd-hud-actions button:focus-visible,
+          .rd-state-actions button:hover,
+          .rd-state-actions button:focus-visible {
+            border-color: rgba(226, 232, 240, 0.68);
+            background: rgba(30, 41, 59, 0.95);
+          }
+          .rd-state-overlay {
+            position: absolute;
+            inset: 0;
+            z-index: 22;
+            display: grid;
+            place-items: center;
+            padding: 1rem;
+            pointer-events: none;
+          }
+          .rd-state-overlay[hidden] {
+            display: none;
+          }
+          .rd-state-card {
+            display: grid;
+            grid-template-columns: auto minmax(0, 1fr);
+            gap: 0.8rem 1rem;
+            align-items: center;
+            width: min(460px, 100%);
+            padding: 1rem;
+            border: 1px solid rgba(71, 85, 105, 0.72);
+            border-radius: 1rem;
+            color: #e2e8f0;
+            background: rgba(2, 6, 23, 0.82);
+            box-shadow: 0 22px 60px rgba(0, 0, 0, 0.48);
+            backdrop-filter: blur(12px);
+            pointer-events: auto;
+          }
+          .rd-state-card > i {
+            width: 2.25rem;
+            height: 2.25rem;
+            display: grid;
+            place-items: center;
+            border-radius: 999px;
+            color: #67e8f9;
+            background: rgba(14, 165, 233, 0.14);
+          }
+          .rd-state-title {
+            font-weight: 800;
+            color: #f8fafc;
+          }
+          .rd-state-detail {
+            margin-top: 0.18rem;
+            color: #94a3b8;
+            font-size: 0.86rem;
+          }
+          .rd-state-actions {
+            grid-column: 1 / -1;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+          }
+          @media (max-width: 760px) {
+            .rd-fullscreen-hud {
+              align-items: stretch;
+              border-radius: 1rem;
+              flex-direction: column;
+            }
+            .rd-hud-metrics {
+              flex-wrap: wrap;
+            }
+          }
+          .rd-diagnostics-hud {
+            position: absolute;
+            top: 1.25rem;
+            right: 1.25rem;
+            z-index: 30;
+            width: min(360px, calc(100% - 2.5rem));
+            max-height: calc(100% - 2.5rem);
+            overflow-y: auto;
+            padding: 14px;
+            border: 1px solid rgba(71, 85, 105, 0.9);
+            border-radius: 12px;
+            color: #e2e8f0;
+            background: rgba(2, 6, 23, 0.9);
+            box-shadow: 0 18px 45px rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(12px);
+            font-size: 12px;
+          }
+          .rd-diagnostics-hud.hidden { display: none; }
+          .rd-file-drop-overlay {
+            position: absolute;
+            inset: 0;
+            z-index: 45;
+            pointer-events: none;
+            border: 3px dashed rgba(56, 189, 248, .95);
+            border-radius: 12px;
+            background: rgba(2, 132, 199, .14);
+            box-shadow: inset 0 0 80px rgba(14, 165, 233, .16);
+          }
+          .rd-file-drop-overlay[hidden], .rd-upload-status[hidden] { display: none; }
+          .rd-file-drop-hint {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 5px;
+            transform: translate(-50%, -50%);
+            padding: 18px 24px;
+            border: 1px solid rgba(125, 211, 252, .55);
+            border-radius: 14px;
+            color: #e0f2fe;
+            background: rgba(2, 6, 23, .9);
+            box-shadow: 0 18px 45px rgba(0, 0, 0, .45);
+            backdrop-filter: blur(10px);
+          }
+          .rd-file-drop-hint i { color: #7dd3fc; font-size: 24px; }
+          .rd-file-drop-hint span { color: #94a3b8; font-size: 11px; }
+          .rd-file-drag-ghost {
+            position: absolute;
+            left: 0;
+            top: 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            max-width: 240px;
+            padding: 8px 11px;
+            border: 1px solid rgba(125, 211, 252, .65);
+            border-radius: 9px;
+            color: #f0f9ff;
+            background: rgba(15, 23, 42, .94);
+            box-shadow: 0 10px 28px rgba(0, 0, 0, .5);
+            transform: translate(14px, 14px);
+            will-change: left, top;
+          }
+          .rd-file-drag-ghost i { color: #7dd3fc; }
+          .rd-file-drag-ghost span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+          .rd-upload-status {
+            position: absolute;
+            left: 50%;
+            bottom: 20px;
+            z-index: 46;
+            width: min(420px, calc(100% - 32px));
+            padding: 11px 13px;
+            border: 1px solid rgba(71, 85, 105, .9);
+            border-radius: 11px;
+            color: #e2e8f0;
+            background: rgba(2, 6, 23, .92);
+            box-shadow: 0 14px 38px rgba(0, 0, 0, .48);
+            transform: translateX(-50%);
+            backdrop-filter: blur(10px);
+          }
+          .rd-upload-status-row { display: flex; align-items: center; gap: 9px; font-size: 12px; }
+          .rd-upload-status-row i { color: #38bdf8; }
+          .rd-upload-progress { height: 4px; margin-top: 9px; overflow: hidden; border-radius: 999px; background: #1e293b; }
+          .rd-upload-progress > div { width: 0; height: 100%; border-radius: inherit; background: #38bdf8; transition: width .15s ease; }
+          .rd-diagnostics-header, .rd-diagnostics-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+          .rd-diagnostics-title { color: #f8fafc; font-size: 14px; font-weight: 700; }
+          .rd-diagnostics-summary { margin-top: 2px; color: #67e8f9; }
+          .rd-diagnostics-summary[data-severity="warn"] { color: #fbbf24; }
+          .rd-diagnostics-summary[data-severity="bad"] { color: #fb7185; }
+          .rd-diagnostics-close { border: 0; background: transparent; color: #94a3b8; font-size: 22px; cursor: pointer; }
+          .rd-diagnostics-meta { justify-content: flex-start; flex-wrap: wrap; margin: 10px 0; color: #94a3b8; font-family: ui-monospace, monospace; }
+          .rd-diagnostics-meta span { padding: 2px 6px; border-radius: 999px; background: rgba(30, 41, 59, 0.8); }
+          .rd-diagnostics-section { padding-top: 9px; margin-top: 9px; border-top: 1px solid rgba(51, 65, 85, 0.75); }
+          .rd-diagnostics-section-title { margin-bottom: 6px; color: #64748b; font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+          .rd-diagnostics-grid { display: grid; grid-template-columns: 1fr auto; gap: 5px 14px; }
+          .rd-diagnostics-grid span { color: #94a3b8; }
+          .rd-diagnostics-grid strong { color: #e2e8f0; font-family: ui-monospace, monospace; font-weight: 600; text-align: right; }
+        </style>
+      </div>
+    </main>
+
+    <script defer src="/vendor/msgpackr/msgpackr.js"></script>
+    <script defer src="/assets/remotedesktop-settings-menu.js"></script>
+    <script type="module" src="/assets/nav.js"></script>
+    <script type="module" src="/assets/remotedesktop.js?v=desktop-file-drop-20260803-2"></script>
+  </body>
+</html>

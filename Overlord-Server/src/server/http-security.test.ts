@@ -1,0 +1,53 @@
+import { describe, expect, test } from "bun:test";
+import { CORS_HEADERS, SECURITY_HEADERS } from "./http-security";
+
+describe("CORS_HEADERS", () => {
+  test("does not opt API responses into cross-origin browser access", () => {
+    expect(CORS_HEADERS).toEqual({});
+    expect(CORS_HEADERS).not.toHaveProperty("Access-Control-Allow-Origin");
+  });
+});
+
+describe("SECURITY_HEADERS", () => {
+  test("sets Content-Security-Policy with self default-src", () => {
+    const csp = SECURITY_HEADERS["Content-Security-Policy"];
+    expect(csp).toContain("default-src 'self'");
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).toContain("font-src 'self' data:");
+    expect(csp).toContain("base-uri 'none'");
+    expect(csp).toContain("form-action 'self'");
+    expect(csp).toContain("object-src blob:");
+    expect(csp).toContain("frame-ancestors 'none'");
+  });
+
+  test("prevents MIME sniffing", () => {
+    expect(SECURITY_HEADERS["X-Content-Type-Options"]).toBe("nosniff");
+  });
+
+  test("denies framing", () => {
+    expect(SECURITY_HEADERS["X-Frame-Options"]).toBe("DENY");
+  });
+
+  test("disables the obsolete browser XSS auditor", () => {
+    expect(SECURITY_HEADERS["X-XSS-Protection"]).toBe("0");
+  });
+
+  test("sets strict referrer policy", () => {
+    expect(SECURITY_HEADERS["Referrer-Policy"]).toBe("strict-origin-when-cross-origin");
+  });
+
+  test("enables HSTS with long max-age", () => {
+    const hsts = SECURITY_HEADERS["Strict-Transport-Security"];
+    expect(hsts).toContain("max-age=");
+    expect(hsts).toContain("includeSubDomains");
+    const maxAge = Number(hsts.match(/max-age=(\d+)/)?.[1] || 0);
+    expect(maxAge).toBeGreaterThanOrEqual(31536000);
+  });
+
+  test("disables camera, geolocation, payment via Permissions-Policy", () => {
+    const pp = SECURITY_HEADERS["Permissions-Policy"];
+    expect(pp).toContain("camera=()");
+    expect(pp).toContain("geolocation=()");
+    expect(pp).toContain("payment=()");
+  });
+});

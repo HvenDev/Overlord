@@ -1,0 +1,2496 @@
+import { encodeMsgpack, decodeMsgpack } from "./msgpack-helpers.js";
+import { checkFeatureAccess } from "./feature-gate.js";
+import { createKeyboardCapture } from "./keyboard-capture.js";
+import { WhepClient } from "./whep.js";
+import { P2PClient } from "./webrtc-p2p.js";
+import { createSharedUiSettingsSaver, loadSharedUiSettings } from "./generated/shared-ui-settings.js";
+
+(async function () {
+  const urlParams = new URLSearchParams(location.search);
+  const clientId = urlParams.get("clientId");
+  if (!clientId) {
+    alert("Missing clientId");
+    return;
+  }
+  // The launcher uses mode=virtual. Keep mode=hidden as a compatibility alias
+  // for older bookmarked URLs.
+  const virtualMode = ["virtual", "hidden"].includes(urlParams.get("mode"));
+
+  const allowed = await checkFeatureAccess("backstage", clientId);
+  if (!allowed) return;
+
+  const clientLabel = document.getElementById("clientLabel");
+  clientLabel.textContent = clientId;
+
+  if (virtualMode) {
+    document.title = "Overlord Virtual";
+    const headerSpan = document.querySelector(".p-3.text-sm.text-slate-400 span");
+    if (headerSpan) {
+      headerSpan.textContent = "Virtual Mode (Virtual Monitor) - Client: ";
+      headerSpan.appendChild(clientLabel);
+    }
+    const ghostIcon = document.querySelector(".p-3.text-sm.text-slate-400 .fa-ghost");
+    if (ghostIcon) {
+      ghostIcon.classList.remove("fa-ghost", "text-violet-400");
+      ghostIcon.classList.add("fa-eye-slash", "text-fuchsia-400");
+    }
+  }
+
+  let ws = null;
+  let reconnectTimer = null;
+  let reconnectDelay = 1000;
+  const maxReconnectDelay = 15000;
+
+  function buildWsUrl() {
+    return (location.protocol === "https:" ? "wss://" : "ws://") +
+      location.host +
+      "/api/clients/" +
+      clientId +
+      "/backstage/ws";
+  }
+
+  function connectWs() {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    ws = new WebSocket(buildWsUrl());
+    ws.binaryType = "arraybuffer";
+    ws.addEventListener("open", onWsOpen);
+    ws.addEventListener("message", onWsMessage);
+    ws.addEventListener("close", onWsClose);
+    ws.addEventListener("error", onWsError);
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      setStreamState("connecting", "Reconnecting");
+      connectWs();
+      reconnectDelay = Math.min(reconnectDelay * 1.5, maxReconnectDelay);
+    }, reconnectDelay);
+  }
+  const latencyEl = document.getElementById("latencyDisplay");
+  const networkStats = document.getElementById("networkStats");
+  let lastInputSentAt = 0;
+  let lastLatencyMs = 0;
+
+  function updateNetworkStats(stats) {
+    if (!networkStats || !stats) return;
+    const media = stats.video || stats.audio;
+    const parts = [];
+    if (Number.isFinite(media?.bitrateMbps)) parts.push(`${media.bitrateMbps.toFixed(1)} Mbps`);
+    if (Number.isFinite(stats.rttMs)) parts.push(`${Math.round(stats.rttMs)} ms`);
+    if (Number.isFinite(media?.lossPercent)) parts.push(`${media.lossPercent.toFixed(1)}% loss`);
+    const route = [stats.protocol, stats.route].filter(Boolean).join("/");
+    if (route) parts.push(route);
+    networkStats.textContent = parts.join(" · ") || "Connected";
+    const details = [];
+    if (media?.codec) details.push(`Codec: ${media.codec}`);
+    if (media?.width && media?.height) details.push(`Video: ${media.width}×${media.height}${media.framesPerSecond ? ` @ ${Math.round(media.framesPerSecond)} FPS` : ""}`);
+    if (Number.isFinite(media?.jitterMs)) details.push(`Jitter: ${media.jitterMs.toFixed(1)} ms`);
+    if (Number.isFinite(media?.jitterBufferMs)) details.push(`Jitter buffer: ${media.jitterBufferMs.toFixed(1)} ms`);
+    if (Number.isFinite(media?.framesDropped)) details.push(`Frames dropped: ${media.framesDropped}`);
+    networkStats.title = details.join("\n");
+  }
+
+  const displaySelect = document.getElementById("displaySelect");
+  const refreshBtn = document.getElementById("refreshDisplays");
+  const startBtn = document.getElementById("startBtn");
+  const stopBtn = document.getElementById("stopBtn");
+  const commandsBtn = document.getElementById("commandsBtn");
+  const killAllBtn = document.getElementById("killAllBtn");
+  const fullscreenBtn = document.getElementById("fullscreenBtn");
+  const mouseCtrl = document.getElementById("mouseCtrl");
+  const kbdCtrl = document.getElementById("kbdCtrl");
+  const autoExplorerCtrl = document.getElementById("autoExplorerCtrl");
+  const qualitySlider = document.getElementById("qualitySlider");
+  const qualityValue = document.getElementById("qualityValue");
+  const codecH264 = document.getElementById("codecH264");
+  const codecMode = document.getElementById("codecMode");
+  const webrtcMode = document.getElementById("webrtcMode");
+  const webrtcVideo = document.getElementById("webrtcVideo");
+  const canvas = document.getElementById("frameCanvas");
+  const canvasContainer = document.getElementById("canvasContainer");
+  const contextMenu = document.getElementById("backstageContextMenu");
+  const ctx = canvas.getContext("2d");
+  const agentFps = document.getElementById("agentFps");
+  const viewerFps = document.getElementById("viewerFps");
+  const statusEl = document.getElementById("streamStatus");
+  const clipboardSyncCtrl = document.getElementById("clipboardSyncCtrl");
+  const clipboardText = document.getElementById("clipboardText");
+  const clipboardFromUserBtn = document.getElementById("clipboardFromUserBtn");
+  const clipboardToUserBtn = document.getElementById("clipboardToUserBtn");
+  const clipboardStatus = document.getElementById("clipboardStatus");
+  const uiaCtrl = document.getElementById("uiaCtrl");
+  const printWindowFallbackCtrl = document.getElementById("printWindowFallbackCtrl");
+  const backstageResolutionSelect = document.getElementById("backstageResolutionSelect");
+  const targetFpsSelect = document.getElementById("targetFpsSelect");
+  let whepClient = null;
+  let p2pClient = null;
+  let webrtcActive = false;
+  const CANVAS_TRANSPORT_PREF_VERSION = 1;
+
+  function getWebrtcMode() {
+    return "off";
+  }
+
+  function syncInputEnableState() {
+    if (mouseCtrl) sendCmd("backstage_enable_mouse", { enabled: mouseCtrl.checked });
+    if (kbdCtrl) sendCmd("backstage_enable_keyboard", { enabled: kbdCtrl.checked });
+    if (uiaCtrl) sendCmd("backstage_enable_uia", { enabled: uiaCtrl.checked });
+    if (printWindowFallbackCtrl) {
+      sendCmd("backstage_enable_printwindow_fallback", { enabled: printWindowFallbackCtrl.checked });
+    }
+    pushbackstageResolution();
+  }
+  let activeClientId = clientId;
+  let renderCount = 0;
+  let renderWindowStart = performance.now();
+  let lastFrameAt = 0;
+  let desiredStreaming = false;
+  let streamState = "connecting";
+  let frameWatchTimer = null;
+  let offlineTimer = null;
+  let frameDecodeBusy = false;
+  let pendingFrame = null;
+  let hasCanvasBase = false;
+  let pendingMove = null;
+  let moveFrame = 0;
+  let videoDecoder = null;
+  let h264TimestampUs = 0;
+  let h264AwaitingKeyframe = true;
+  let h264RecoveryRequestedAt = 0;
+  let prefersH264 = false;
+  const maxH264DecodeQueue = 4;
+  const inputBackpressureBytes = 256 * 1024;
+  let h264ErrorCount = 0;
+  let h264RetryTimer = null;
+
+  let clipboardSyncTimer = null;
+  let lastClipboardText = null;
+  let clipboardSyncActive = false;
+  let clipboardPullPending = false;
+
+  let savedDisplay = null;
+
+  function setSelectValue(select, value) {
+    if (!select || value === undefined || value === null) return false;
+    const normalized = String(value);
+    const exists = Array.from(select.options || []).some((opt) => opt.value === normalized);
+    if (!exists) return false;
+    select.value = normalized;
+    return true;
+  }
+
+  function applySavedDisplay() {
+    if (savedDisplay === null || savedDisplay === undefined) return;
+    setSelectValue(displaySelect, savedDisplay);
+  }
+
+  function applySharedSettings(settings) {
+    if (!settings || typeof settings !== "object") return;
+    savedDisplay = Number.isFinite(Number(settings.display)) ? Number(settings.display) : savedDisplay;
+    setSelectValue(backstageResolutionSelect, settings.resolution);
+    setSelectValue(targetFpsSelect, settings.targetFps);
+    setSelectValue(webrtcMode, "off");
+    if (qualitySlider && settings.quality !== undefined) qualitySlider.value = String(settings.quality);
+    if (clipboardSyncCtrl && typeof settings.clipboardSync === "boolean") clipboardSyncCtrl.checked = settings.clipboardSync;
+    if (uiaCtrl && typeof settings.uia === "boolean") uiaCtrl.checked = settings.uia;
+    if (printWindowFallbackCtrl && typeof settings.printWindowFallback === "boolean") {
+      printWindowFallbackCtrl.checked = settings.printWindowFallback;
+    }
+    prefersH264 = false;
+    const cloneToggle = document.getElementById("backstageCloneToggle");
+    const cloneLiteToggle = document.getElementById("backstageCloneLiteToggle");
+    const killIfRunningToggle = document.getElementById("backstageKillIfRunningToggle");
+    if (cloneToggle && typeof settings.cloneProfile === "boolean") cloneToggle.checked = settings.cloneProfile;
+    if (cloneLiteToggle && typeof settings.cloneLite === "boolean") cloneLiteToggle.checked = settings.cloneLite;
+    if (killIfRunningToggle && typeof settings.killIfRunning === "boolean") {
+      killIfRunningToggle.checked = settings.killIfRunning;
+    }
+    const injectionMethodSelect = document.getElementById("backstageInjectionMethod");
+    if (injectionMethodSelect && typeof settings.injectionMethod === "string") {
+      const allowed = ["reflective", "loadlibrary"];
+      if (allowed.includes(settings.injectionMethod)) {
+        setSelectValue(injectionMethodSelect, settings.injectionMethod);
+      }
+    }
+    applySavedDisplay();
+  }
+
+  function readSharedSettings() {
+    return {
+      display: Number(displaySelect?.value || 0),
+      resolution: backstageResolutionSelect?.value || "1080",
+      targetFps: Number(targetFpsSelect?.value || 120),
+      quality: Number(qualitySlider?.value || 90),
+      preferH264: false,
+      webrtcMode: "off",
+      transportPreferenceVersion: CANVAS_TRANSPORT_PREF_VERSION,
+      mouse: !!mouseCtrl?.checked,
+      keyboard: !!kbdCtrl?.checked,
+      clipboardSync: !!clipboardSyncCtrl?.checked,
+      uia: !!uiaCtrl?.checked,
+      printWindowFallback: printWindowFallbackCtrl?.checked !== false,
+      cloneProfile: document.getElementById("backstageCloneToggle")?.checked !== false,
+      cloneLite: document.getElementById("backstageCloneLiteToggle")?.checked === true,
+      killIfRunning: document.getElementById("backstageKillIfRunningToggle")?.checked === true,
+      injectionMethod: readInjectionMethod(),
+    };
+  }
+
+  function readInjectionMethod() {
+    return document.getElementById("backstageInjectionMethod")?.value || "reflective";
+  }
+
+  applySharedSettings(await loadSharedUiSettings("backstage"));
+  // Interactive input is intentionally session-scoped: opening any client's
+  // page must require the operator to opt in again, regardless of saved UI
+  // settings.
+  if (mouseCtrl) mouseCtrl.checked = false;
+  if (kbdCtrl) kbdCtrl.checked = false;
+  const sharedSettingsSaver = createSharedUiSettingsSaver("backstage", readSharedSettings);
+
+  if (codecH264) {
+    codecH264.checked = false;
+    codecH264.disabled = true;
+  }
+  if (webrtcMode) {
+    webrtcMode.value = "off";
+    webrtcMode.disabled = true;
+  }
+
+  function setCodecModeLabel(mode, detail) {
+    if (!codecMode) return;
+    const suffix = detail ? ` (${detail})` : "";
+    codecMode.textContent = `Codec: ${String(mode || "auto").toUpperCase()}${suffix}`;
+  }
+
+  setCodecModeLabel("jpeg", "enforced");
+  setStreamState("connecting", "Connecting");
+
+  function updateFpsDisplay(agentValue) {
+    if (agentValue !== undefined && agentValue !== null && agentFps) {
+      agentFps.textContent = String(agentValue);
+    }
+    const now = performance.now();
+    renderCount += 1;
+    const elapsed = now - renderWindowStart;
+    if (elapsed >= 1000 && viewerFps) {
+      const fps = Math.round((renderCount * 1000) / elapsed);
+      viewerFps.textContent = String(fps);
+      renderCount = 0;
+      renderWindowStart = now;
+    }
+  }
+
+  function setStreamState(state, text) {
+    streamState = state;
+    if (statusEl) {
+      const icons = {
+        connecting: '<i class="fa-solid fa-circle-notch fa-spin"></i>',
+        starting: '<i class="fa-solid fa-circle-notch fa-spin"></i>',
+        stopping: '<i class="fa-solid fa-circle-notch fa-spin"></i>',
+        streaming: '<i class="fa-solid fa-circle text-violet-400"></i>',
+        idle: '<i class="fa-solid fa-circle text-slate-400"></i>',
+        stalled: '<i class="fa-solid fa-triangle-exclamation text-amber-400"></i>',
+        offline: '<i class="fa-solid fa-plug-circle-xmark text-rose-400"></i>',
+        disconnected: '<i class="fa-solid fa-link-slash text-slate-400"></i>',
+        error: '<i class="fa-solid fa-circle-exclamation text-rose-400"></i>',
+      };
+      const label = text ||
+        (state === "streaming" ? "Streaming" :
+          state === "starting" ? "Starting" :
+            state === "stopping" ? "Stopping" :
+              state === "offline" ? "Client offline" :
+                state === "disconnected" ? "Disconnected" :
+                  state === "stalled" ? "No frames" :
+                    state === "idle" ? "Stopped" :
+                      "Connecting");
+
+      statusEl.innerHTML = icons[state] || icons.idle;
+      const labelEl = document.createElement("span");
+      labelEl.textContent = String(label || "");
+      statusEl.appendChild(labelEl);
+      const base = "inline-flex items-center gap-2 px-3 py-2 rounded-full border text-sm";
+      const styles = {
+        streaming: "bg-violet-900/40 text-violet-100 border-violet-700/70",
+        starting: "bg-sky-900/40 text-sky-100 border-sky-700/70",
+        stopping: "bg-amber-900/40 text-amber-100 border-amber-700/70",
+        stalled: "bg-amber-900/40 text-amber-100 border-amber-700/70",
+        offline: "bg-rose-900/40 text-rose-100 border-rose-700/70",
+        error: "bg-rose-900/40 text-rose-100 border-rose-700/70",
+        disconnected: "bg-slate-800 text-slate-300 border-slate-700",
+        idle: "bg-slate-800 text-slate-300 border-slate-700",
+        connecting: "bg-slate-800 text-slate-300 border-slate-700",
+      };
+      statusEl.className = `${base} ${styles[state] || styles.idle}`;
+    }
+
+    if (canvasContainer) {
+      canvasContainer.dataset.streamState = state;
+    }
+
+    if (state === "idle" || state === "offline" || state === "disconnected" || state === "error") {
+      if (agentFps) agentFps.textContent = "--";
+      if (viewerFps) viewerFps.textContent = "--";
+      renderCount = 0;
+      renderWindowStart = performance.now();
+    }
+
+    updateControls();
+    checkClipboardSync();
+  }
+
+  function updateControls() {
+    const wsOpen = ws && ws.readyState === WebSocket.OPEN;
+    const isStarting = streamState === "starting";
+    const isStreaming = streamState === "streaming";
+    const isStopping = streamState === "stopping";
+    const isBlocked = streamState === "offline" || streamState === "disconnected" || streamState === "error";
+
+    if (startBtn) {
+      startBtn.disabled = !wsOpen || isStarting || isStreaming || isStopping || isBlocked;
+    }
+    if (stopBtn) {
+      stopBtn.disabled = !wsOpen || (!isStarting && !isStreaming);
+    }
+  }
+
+  function setClipboardStatus(message, isError = false) {
+    if (!clipboardStatus) return;
+    clipboardStatus.textContent = message;
+    clipboardStatus.classList.toggle("text-red-400", isError);
+    clipboardStatus.classList.toggle("text-slate-500", !isError);
+  }
+
+  function clipboardTextFits(text) {
+    return new TextEncoder().encode(text).byteLength <= 64 * 1024;
+  }
+
+  async function pushBrowserClipboard() {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!clipboardTextFits(text)) {
+        setClipboardStatus("Clipboard text is larger than the 64 KiB sync limit.", true);
+        return false;
+      }
+      if (clipboardText) clipboardText.value = text;
+      if (text !== lastClipboardText) {
+        lastClipboardText = text;
+        sendCmd("clipboard_sync", { text });
+      }
+      return true;
+    } catch {
+      setClipboardStatus("Browser clipboard access is blocked. Allow clipboard permission to enable outgoing sync.", true);
+      return false;
+    }
+  }
+
+  function handleClipboardContentMessage(msg) {
+    if (!msg || typeof msg.text !== "string") return;
+    const text = msg.text;
+    lastClipboardText = text;
+    if (clipboardText) clipboardText.value = text;
+    const shouldWrite = clipboardPullPending
+      || (clipboardSyncCtrl && clipboardSyncCtrl.checked && streamState === "streaming");
+    if (!shouldWrite) return;
+    const wasManual = clipboardPullPending;
+    clipboardPullPending = false;
+    const writePromise = navigator.clipboard?.writeText?.(text);
+    if (!writePromise) {
+      setClipboardStatus("Received from user. Select the text above and press Ctrl+C.", true);
+      clipboardText?.focus();
+      clipboardText?.select();
+      return;
+    }
+    writePromise.then(() => {
+      setClipboardStatus(wasManual ? "Copied from user." : "Clipboard synced from user.");
+    }).catch(() => {
+      setClipboardStatus("Received from user. Select the text above and press Ctrl+C.", true);
+      clipboardText?.focus();
+      clipboardText?.select();
+    });
+  }
+
+  function startClipboardSync() {
+    if (clipboardSyncActive) return;
+    clipboardSyncActive = true;
+    lastClipboardText = null;
+    sendCmd("clipboard_sync_start", {});
+    void pushBrowserClipboard();
+    clipboardSyncTimer = setInterval(async () => {
+      if (!clipboardSyncCtrl || !clipboardSyncCtrl.checked || streamState !== "streaming") {
+        stopClipboardSync();
+        return;
+      }
+      await pushBrowserClipboard();
+    }, 1500);
+  }
+
+  function stopClipboardSync() {
+    if (!clipboardSyncActive) return;
+    clipboardSyncActive = false;
+    if (clipboardSyncTimer) {
+      clearInterval(clipboardSyncTimer);
+      clipboardSyncTimer = null;
+    }
+    sendCmd("clipboard_sync_stop", {});
+  }
+
+  function checkClipboardSync() {
+    const shouldSync = clipboardSyncCtrl && clipboardSyncCtrl.checked && streamState === "streaming";
+    if (shouldSync && !clipboardSyncActive) {
+      startClipboardSync();
+    } else if (!shouldSync && clipboardSyncActive) {
+      stopClipboardSync();
+    }
+  }
+
+  if (clipboardSyncCtrl) {
+    clipboardSyncCtrl.addEventListener("change", function () {
+      checkClipboardSync();
+      sharedSettingsSaver.scheduleSave();
+    });
+  }
+
+  function clearOfflineTimer() {
+    if (offlineTimer) {
+      clearTimeout(offlineTimer);
+      offlineTimer = null;
+    }
+  }
+
+  function scheduleOffline(reason) {
+    clearOfflineTimer();
+    setStreamState("connecting", "Reconnecting");
+    offlineTimer = setTimeout(() => {
+      const now = performance.now();
+      if (!lastFrameAt || now - lastFrameAt > 3000) {
+        desiredStreaming = false;
+        setStreamState("offline", reason || "Client offline");
+      }
+    }, 3000);
+  }
+
+  function handleStatus(msg) {
+    if (!msg || msg.type !== "status" || !msg.status) return;
+    if (msg.status === "offline") {
+      scheduleOffline(msg.reason);
+      return;
+    }
+    if (msg.status === "connecting") {
+      clearOfflineTimer();
+      setStreamState("connecting", "Connecting");
+      return;
+    }
+    if (msg.status === "online") {
+      clearOfflineTimer();
+      if (desiredStreaming) {
+        setStreamState("starting", "Reconnecting");
+        const mode = getWebrtcMode();
+        if (displaySelect && displaySelect.value !== undefined) {
+          sendCmd("backstage_select_display", {
+            display: parseInt(displaySelect.value, 10) || 0,
+          });
+        }
+        pushTargetFps();
+        sendCmd("backstage_start", {
+          autoStartExplorer: false,
+          webrtc: mode === "relayed",
+          ...(virtualMode ? { virtual_mode: true, hidden_mode: true } : {}),
+        });
+        if (mode === "p2p") startP2P();
+        syncInputEnableState();
+      } else {
+        setStreamState("idle", "Stopped");
+      }
+    }
+  }
+
+  const cloneProgressEl = document.getElementById("cloneProgress");
+  const cloneProgressBar = document.getElementById("cloneProgressBar");
+  const cloneProgressPct = document.getElementById("cloneProgressPct");
+  const cloneProgressLabel = document.getElementById("cloneProgressLabel");
+  const cloneSkippedList = document.getElementById("cloneSkippedList");
+  let cloneHideTimer = null;
+  let cloneSkippedExpanded = false;
+  let cloneSkippedFiles = [];
+
+  function renderCloneSkippedList() {
+    if (!cloneSkippedList || !cloneProgressLabel) return;
+    cloneProgressLabel.setAttribute("aria-expanded", cloneSkippedExpanded ? "true" : "false");
+    if (!cloneSkippedExpanded || cloneSkippedFiles.length === 0) {
+      cloneSkippedList.classList.add("hidden");
+      cloneSkippedList.replaceChildren();
+      return;
+    }
+
+    cloneSkippedList.replaceChildren();
+    for (const item of cloneSkippedFiles) {
+      const row = document.createElement("div");
+      row.className = "border-b border-slate-800 py-1 last:border-b-0";
+
+      const file = document.createElement("div");
+      file.className = "font-mono text-violet-200 break-all";
+      file.textContent = item.file || "unknown file";
+      row.appendChild(file);
+
+      if (item.error) {
+        const err = document.createElement("div");
+        err.className = "mt-1 text-rose-300 break-all";
+        err.textContent = item.error;
+        row.appendChild(err);
+      }
+
+      cloneSkippedList.appendChild(row);
+    }
+    cloneSkippedList.classList.remove("hidden");
+  }
+
+  function setCloneSkippedExpanded(expanded) {
+    cloneSkippedExpanded = Boolean(expanded && cloneSkippedFiles.length > 0);
+    renderCloneSkippedList();
+  }
+
+  function addCloneSkipped(status) {
+    const parts = String(status || "").split("|");
+    if (parts[0] !== "skipped") return;
+    const file = parts[1] || "";
+    const error = parts.slice(2).join("|");
+    const key = `${file}\n${error}`;
+    if (!cloneSkippedFiles.some((item) => `${item.file}\n${item.error}` === key)) {
+      cloneSkippedFiles.push({ file, error });
+    }
+    renderCloneSkippedList();
+  }
+
+  cloneProgressLabel?.addEventListener("click", () => {
+    setCloneSkippedExpanded(!cloneSkippedExpanded);
+  });
+  cloneProgressLabel?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      setCloneSkippedExpanded(!cloneSkippedExpanded);
+    }
+  });
+
+  function cloneProgressText(status, browser, copiedMB, totalMB) {
+    const parts = String(status || "").split("|");
+    const kind = parts[0] || "";
+    if (kind === "copying") {
+      const file = parts.slice(1).join("|");
+      return {
+        text: `Copying ${browser} — ${file || "current file"}`,
+        title: file,
+      };
+    }
+    if (kind === "retrying") {
+      const attempt = parts[1] || "?";
+      const max = parts[2] || "?";
+      const file = parts[3] || "";
+      const err = parts.slice(4).join("|");
+      return {
+        text: `Retrying ${browser} copy (${attempt}/${max}) — ${file || "current file"}`,
+        title: err ? `${file}\n${err}` : file,
+      };
+    }
+    if (kind === "skipped") {
+      const file = parts[1] || "";
+      const err = parts.slice(2).join("|");
+      return {
+        text: `Skipped ${browser} copy — ${file || "file"}`,
+        title: err ? `${file}\n${err}` : file,
+      };
+    }
+    if (kind === "failed") {
+      const detail = parts.slice(1).join("|");
+      return {
+        text: `${browser} clone failed — ${detail || "copy error"}`,
+        title: detail,
+      };
+    }
+    return {
+      text: `Cloning ${browser} — ${copiedMB} / ${totalMB} MB`,
+      title: "",
+    };
+  }
+
+  function handleCloneProgress(msg) {
+    if (!cloneProgressEl) return;
+    const pct = Math.min(100, Math.max(0, Number(msg.percent) || 0));
+    const status = msg.status || "";
+    const browser = msg.browser || "";
+    const totalMB = ((Number(msg.totalBytes) || 0) / (1024 * 1024)).toFixed(1);
+    const copiedMB = ((Number(msg.copiedBytes) || 0) / (1024 * 1024)).toFixed(1);
+
+    if (cloneHideTimer) {
+      clearTimeout(cloneHideTimer);
+      cloneHideTimer = null;
+    }
+
+    cloneProgressEl.classList.remove("hidden");
+    cloneProgressEl.classList.add("flex");
+
+    if (status === "scanning") {
+      cloneSkippedFiles = [];
+      setCloneSkippedExpanded(false);
+      cloneProgressBar.style.width = "0%";
+      cloneProgressPct.textContent = "…";
+      cloneProgressLabel.textContent = `Scanning ${browser} profile`;
+      cloneProgressLabel.title = "";
+      return;
+    }
+
+    if (String(status).startsWith("skipped|")) {
+      addCloneSkipped(status);
+    }
+
+    if (status === "done" || String(status).startsWith("done_with_errors|")) {
+      cloneProgressBar.style.width = "100%";
+      cloneProgressPct.textContent = "100%";
+      const failedCount = String(status).startsWith("done_with_errors|") ? String(status).split("|")[1] || "0" : "";
+      cloneProgressLabel.textContent = failedCount ? `${browser} clone complete — ${failedCount} skipped (click to expand)` : `${browser} clone complete`;
+      cloneProgressLabel.title = failedCount ? `${failedCount} file(s) failed to copy. Click to expand.` : "";
+      if (!failedCount) {
+        cloneHideTimer = setTimeout(() => {
+          cloneProgressEl.classList.add("hidden");
+          cloneProgressEl.classList.remove("flex");
+          setCloneSkippedExpanded(false);
+        }, 3000);
+      }
+      return;
+    }
+
+    const detail = cloneProgressText(status, browser, copiedMB, totalMB);
+    cloneProgressBar.style.width = `${pct}%`;
+    cloneProgressPct.textContent = `${pct}%`;
+    cloneProgressLabel.textContent = detail.text;
+    cloneProgressLabel.title = detail.title;
+  }
+
+  const dxgiStatusEl = document.getElementById("dxgiStatus");
+  const dxgiStatusIcon = document.getElementById("dxgiStatusIcon");
+  const dxgiStatusLabel = document.getElementById("dxgiStatusLabel");
+  let dxgiHideTimer = null;
+
+  function handleDXGIStatus(msg) {
+    if (!dxgiStatusEl) return;
+    if (dxgiHideTimer) {
+      clearTimeout(dxgiHideTimer);
+      dxgiHideTimer = null;
+    }
+    dxgiStatusEl.classList.remove("hidden");
+    dxgiStatusEl.classList.add("flex");
+    if (msg.success) {
+      dxgiStatusIcon.className = "fa-solid fa-microchip text-emerald-400";
+      dxgiStatusLabel.textContent = msg.message || "DXGI active";
+      dxgiStatusLabel.className = "text-emerald-300";
+      dxgiHideTimer = setTimeout(() => {
+        dxgiStatusEl.classList.add("hidden");
+        dxgiStatusEl.classList.remove("flex");
+      }, 8000);
+    } else {
+      dxgiStatusIcon.className = "fa-solid fa-microchip text-rose-400";
+      dxgiStatusLabel.textContent = msg.message || "DXGI failed";
+      dxgiStatusLabel.className = "text-rose-300";
+      dxgiHideTimer = setTimeout(() => {
+        dxgiStatusEl.classList.add("hidden");
+        dxgiStatusEl.classList.remove("flex");
+      }, 10000);
+    }
+  }
+
+  const launchStatusEl = document.getElementById("launchStatus");
+  const launchStatusIcon = document.getElementById("launchStatusIcon");
+  const launchStatusLabel = document.getElementById("launchStatusLabel");
+  let launchHideTimer = null;
+
+  function handleBrowserLaunchStatus(msg) {
+    if (!launchStatusEl) return;
+    if (launchHideTimer) {
+      clearTimeout(launchHideTimer);
+      launchHideTimer = null;
+    }
+    launchStatusEl.classList.remove("hidden");
+    launchStatusEl.classList.add("flex");
+
+    const browser = msg.browser || "browser";
+    const step = msg.step || "";
+    const detail = msg.detail || "";
+
+    if (step === "crashed" || step === "exited") {
+      launchStatusIcon.className = "fa-solid fa-skull-crossbones text-rose-400";
+      launchStatusLabel.textContent = `${browser}: ${detail}`;
+      launchStatusLabel.className = "text-rose-300";
+      launchHideTimer = setTimeout(() => {
+        launchStatusEl.classList.add("hidden");
+        launchStatusEl.classList.remove("flex");
+      }, 20000);
+    } else if (!msg.success) {
+      launchStatusIcon.className = "fa-solid fa-circle-xmark text-rose-400";
+      launchStatusLabel.textContent = `${browser} ${step}: ${detail}`;
+      launchStatusLabel.className = "text-rose-300";
+      launchHideTimer = setTimeout(() => {
+        launchStatusEl.classList.add("hidden");
+        launchStatusEl.classList.remove("flex");
+      }, 15000);
+    } else if (step === "healthy") {
+      launchStatusIcon.className = "fa-solid fa-heart-pulse text-emerald-400";
+      launchStatusLabel.textContent = `${browser}: ${detail}`;
+      launchStatusLabel.className = "text-emerald-300";
+      launchHideTimer = setTimeout(() => {
+        launchStatusEl.classList.add("hidden");
+        launchStatusEl.classList.remove("flex");
+      }, 10000);
+    } else if (step === "launch") {
+      launchStatusIcon.className = "fa-solid fa-circle-check text-emerald-400";
+      launchStatusLabel.textContent = `${browser}: ${detail}`;
+      launchStatusLabel.className = "text-emerald-300";
+      launchHideTimer = setTimeout(() => {
+        launchStatusEl.classList.add("hidden");
+        launchStatusEl.classList.remove("flex");
+      }, 8000);
+    } else if (step === "kill") {
+      launchStatusIcon.className = "fa-solid fa-hand text-amber-400";
+      launchStatusLabel.textContent = `${browser}: ${detail}`;
+      launchStatusLabel.className = "text-amber-300";
+    } else {
+      launchStatusIcon.className = "fa-solid fa-spinner fa-spin text-sky-400";
+      launchStatusLabel.textContent = `${browser} ${step}: ${detail}`;
+      launchStatusLabel.className = "text-sky-300";
+    }
+  }
+
+  function handlebackstageError(msg) {
+    const errorText = msg.error || msg.message || "Unknown backstage error";
+    console.error("backstage: server error:", errorText);
+    if (!launchStatusEl) return;
+    if (launchHideTimer) {
+      clearTimeout(launchHideTimer);
+      launchHideTimer = null;
+    }
+    launchStatusEl.classList.remove("hidden");
+    launchStatusEl.classList.add("flex");
+    if (msg.critical) {
+      launchStatusIcon.className = "fa-solid fa-triangle-exclamation text-red-500 text-lg animate-pulse";
+      launchStatusLabel.textContent = errorText;
+      launchStatusLabel.className = "text-red-400 font-bold";
+      launchStatusEl.className = "flex items-center gap-2 bg-red-950/80 border-2 border-red-500 rounded-lg px-4 py-3 text-sm shadow-lg shadow-red-500/20";
+      launchHideTimer = setTimeout(() => {
+        launchStatusEl.className = "hidden items-center gap-2 bg-slate-900/70 border border-slate-800 rounded-lg px-3 py-2 text-sm";
+      }, 30000);
+    } else {
+      launchStatusIcon.className = "fa-solid fa-circle-exclamation text-rose-400";
+      launchStatusLabel.textContent = errorText;
+      launchStatusLabel.className = "text-rose-300";
+      launchHideTimer = setTimeout(() => {
+        launchStatusEl.classList.add("hidden");
+        launchStatusEl.classList.remove("flex");
+      }, 15000);
+    }
+  }
+
+  function handleBrowserCheckResult(msg) {
+    if (!msg.browsers || !contextMenu) return;
+    contextMenu.querySelectorAll("[data-browser]").forEach((btn) => {
+      const key = btn.dataset.browser;
+      if (key && msg.browsers[key] === false) {
+        btn.classList.add("browser-unavailable");
+      } else {
+        btn.classList.remove("browser-unavailable");
+      }
+    });
+  }
+
+  function requestBrowserCheck() {
+    sendCmd("backstage_browser_check", {});
+  }
+
+  const installedAppsLoading = document.getElementById("installedAppsLoading");
+  const installedAppsList = document.getElementById("installedAppsList");
+  const installedAppsGrid = document.getElementById("installedAppsGrid");
+  const installedAppsCount = document.getElementById("installedAppsCount");
+  const refreshInstalledApps = document.getElementById("refreshInstalledApps");
+  const installedAppsSearch = document.getElementById("installedAppsSearch");
+  const installedAppsSearchClear = document.getElementById("installedAppsSearchClear");
+  const installedAppsEmpty = document.getElementById("installedAppsEmpty");
+  let installedAppsData = [];
+  let installedAppsQuery = "";
+
+  let installedAppsLoading_pending = false;
+
+  function requestInstalledApps() {
+    installedAppsData = [];
+    installedAppsLoading_pending = true;
+    if (installedAppsLoading) installedAppsLoading.classList.remove("hidden");
+    if (installedAppsList) installedAppsList.classList.add("hidden");
+    if (installedAppsGrid) installedAppsGrid.innerHTML = "";
+    if (installedAppsCount) installedAppsCount.textContent = "";
+    if (installedAppsEmpty) installedAppsEmpty.classList.add("hidden");
+    sendCmd("backstage_installed_apps", {});
+  }
+
+  function applyInstalledAppsFilter() {
+    if (!installedAppsGrid) return;
+    const q = installedAppsQuery;
+    let visible = 0;
+    const buttons = Array.from(installedAppsGrid.children);
+
+    if (q) {
+      const prefix = [];
+      const contains = [];
+      const hidden = [];
+      for (const btn of buttons) {
+        const key = btn.dataset.search || "";
+        const name = (btn.dataset.name || "");
+        if (name.startsWith(q) || key.startsWith(q)) {
+          prefix.push(btn);
+        } else if (key.indexOf(q) !== -1) {
+          contains.push(btn);
+        } else {
+          hidden.push(btn);
+        }
+      }
+      for (const btn of prefix) { installedAppsGrid.appendChild(btn); btn.style.display = ""; }
+      for (const btn of contains) { installedAppsGrid.appendChild(btn); btn.style.display = ""; }
+      for (const btn of hidden) { installedAppsGrid.appendChild(btn); btn.style.display = "none"; }
+      visible = prefix.length + contains.length;
+    } else {
+      for (const btn of buttons) {
+        btn.style.display = "";
+        visible++;
+      }
+    }
+
+    if (installedAppsEmpty) {
+      installedAppsEmpty.classList.toggle("hidden", !(q && visible === 0 && installedAppsData.length > 0));
+    }
+    if (installedAppsSearchClear) {
+      installedAppsSearchClear.classList.toggle("hidden", !q);
+    }
+  }
+
+  if (installedAppsSearch) {
+    installedAppsSearch.addEventListener("input", () => {
+      installedAppsQuery = installedAppsSearch.value.trim().toLowerCase();
+      applyInstalledAppsFilter();
+    });
+    installedAppsSearch.addEventListener("click", (e) => e.stopPropagation());
+    installedAppsSearch.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        installedAppsSearch.value = "";
+        installedAppsQuery = "";
+        applyInstalledAppsFilter();
+      }
+      e.stopPropagation();
+    });
+  }
+  if (installedAppsSearchClear) {
+    installedAppsSearchClear.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (installedAppsSearch) installedAppsSearch.value = "";
+      installedAppsQuery = "";
+      applyInstalledAppsFilter();
+      if (installedAppsSearch) installedAppsSearch.focus();
+    });
+  }
+
+  if (refreshInstalledApps) {
+    refreshInstalledApps.addEventListener("click", (e) => {
+      e.stopPropagation();
+      requestInstalledApps();
+    });
+  }
+
+  function handleInstalledAppsResult(msg) {
+    if (!installedAppsGrid) return;
+    const apps = msg.apps || [];
+    const done = !!msg.done;
+
+    if (apps.length > 0) {
+      installedAppsData.push(...apps);
+      if (installedAppsLoading) installedAppsLoading.classList.add("hidden");
+      if (installedAppsList) installedAppsList.classList.remove("hidden");
+      if (installedAppsCount) installedAppsCount.textContent = `(${installedAppsData.length}${done ? "" : "…"})`;
+
+      for (const app of apps) {
+        appendAppButton(app);
+      }
+    }
+
+    if (done) {
+      installedAppsLoading_pending = false;
+      if (installedAppsLoading) installedAppsLoading.classList.add("hidden");
+      if (installedAppsList) installedAppsList.classList.remove("hidden");
+      if (installedAppsCount) installedAppsCount.textContent = `(${installedAppsData.length})`;
+      if (installedAppsData.length === 0) {
+        installedAppsGrid.innerHTML = '<div class="text-xs text-slate-600 text-center py-3">No apps found</div>';
+      } else {
+        installedAppsData.sort((a, b) => (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" }));
+        installedAppsGrid.innerHTML = "";
+        for (const app of installedAppsData) {
+          appendAppButton(app);
+        }
+      }
+    }
+
+    applyInstalledAppsFilter();
+  }
+
+  function appendAppButton(app) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "installed-app-btn";
+    btn.title = app.exePath || app.name;
+    btn.dataset.search = ((app.name || "") + " " + (app.exePath || "")).toLowerCase();
+    btn.dataset.name = (app.name || "").toLowerCase();
+    if (installedAppsQuery && btn.dataset.search.indexOf(installedAppsQuery) === -1) {
+      btn.style.display = "none";
+    }
+
+    if (app.icon && /^[A-Za-z0-9+/=]+$/.test(app.icon)) {
+      const img = document.createElement("img");
+      img.src = "data:image/png;base64," + app.icon;
+      img.alt = "";
+      btn.appendChild(img);
+    } else {
+      const placeholder = document.createElement("span");
+      placeholder.className = "app-icon-placeholder";
+      placeholder.innerHTML = '<i class="fa-solid fa-cube"></i>';
+      btn.appendChild(placeholder);
+    }
+    const nameSpan = document.createElement("span");
+    nameSpan.className = "app-name";
+    nameSpan.textContent = app.name;
+    btn.appendChild(nameSpan);
+
+    btn.addEventListener("click", () => {
+      sendCmd("backstage_start_process", { path: '"' + app.exePath + '"' });
+      hideContextMenu();
+    });
+    installedAppsGrid.appendChild(btn);
+  }
+
+  function escapeHtml(str) {
+    const div = document.createElement("div");
+    div.textContent = str;
+    return div.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  function sendCmd(type, payload) {
+    if (!activeClientId) {
+      console.warn("No active client selected");
+      return;
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const msg = { type, ...payload };
+    console.debug("backstage: send", msg);
+    ws.send(encodeMsgpack(msg));
+  }
+
+  function setWebrtcViewActive(active) {
+    webrtcActive = !!active;
+    if (canvas) canvas.style.display = active ? "none" : "block";
+    if (webrtcVideo) webrtcVideo.style.display = active ? "block" : "none";
+    if (!active && networkStats) {
+      networkStats.textContent = "--";
+      networkStats.title = "";
+    }
+  }
+
+  function onWebrtcState(label, state) {
+    console.debug(`backstage webrtc[${label}]: state`, state);
+    if (state === "connected") {
+      setStreamState("streaming", `Streaming (${label})`);
+    } else if (state === "failed" || state === "disconnected") {
+      setWebrtcViewActive(false);
+    }
+  }
+
+  let webrtcRvfcHandle = 0;
+  let webrtcFpsCount = 0;
+  let webrtcFpsWindowStart = 0;
+
+  function startWebrtcFrameTicker() {
+    if (!webrtcVideo || typeof webrtcVideo.requestVideoFrameCallback !== "function") return;
+    stopWebrtcFrameTicker();
+    webrtcFpsCount = 0;
+    webrtcFpsWindowStart = performance.now();
+    const tick = (now) => {
+      lastFrameAt = performance.now();
+      clearOfflineTimer();
+      webrtcFpsCount += 1;
+      const elapsed = now - webrtcFpsWindowStart;
+      if (elapsed >= 1000) {
+        const fps = Math.round((webrtcFpsCount * 1000) / elapsed);
+        updateFpsDisplay(fps);
+        webrtcFpsCount = 0;
+        webrtcFpsWindowStart = now;
+      } else {
+        updateFpsDisplay();
+      }
+      webrtcRvfcHandle = webrtcVideo.requestVideoFrameCallback(tick);
+    };
+    webrtcRvfcHandle = webrtcVideo.requestVideoFrameCallback(tick);
+  }
+
+  function stopWebrtcFrameTicker() {
+    if (webrtcRvfcHandle && webrtcVideo && typeof webrtcVideo.cancelVideoFrameCallback === "function") {
+      webrtcVideo.cancelVideoFrameCallback(webrtcRvfcHandle);
+    }
+    webrtcRvfcHandle = 0;
+  }
+
+  async function startWhep(whepPath) {
+    await stopAllWebrtc();
+    if (!webrtcVideo) return;
+    whepClient = new WhepClient({
+      whepPath,
+      videoEl: webrtcVideo,
+      onState: (state) => onWebrtcState("WebRTC Relayed", state),
+      onStats: (stats) => updateNetworkStats({ ...stats, route: "Server" }),
+    });
+    try {
+      await whepClient.start();
+      setWebrtcViewActive(true);
+      startWebrtcFrameTicker();
+    } catch (err) {
+      console.warn("backstage webrtc: WHEP start failed, falling back to canvas", err);
+      setWebrtcViewActive(false);
+      whepClient = null;
+    }
+  }
+
+  async function startP2P() {
+    await stopAllWebrtc();
+    if (!webrtcVideo) return;
+    p2pClient = new P2PClient({
+      videoEl: webrtcVideo,
+      send: (msg) => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(encodeMsgpack(msg));
+        }
+      },
+      onState: (state) => onWebrtcState("WebRTC P2P", state),
+      onStats: updateNetworkStats,
+    });
+    try {
+      await p2pClient.start();
+      setWebrtcViewActive(true);
+      startWebrtcFrameTicker();
+    } catch (err) {
+      console.warn("backstage webrtc: P2P start failed, falling back to canvas", err);
+      setWebrtcViewActive(false);
+      const client = p2pClient;
+      p2pClient = null;
+      if (client) { try { await client.stop(); } catch {} }
+    }
+  }
+
+  async function stopAllWebrtc() {
+    stopWebrtcFrameTicker();
+    setWebrtcViewActive(false);
+    const whep = whepClient;
+    whepClient = null;
+    if (whep) { try { await whep.stop(); } catch {} }
+    const p2p = p2pClient;
+    p2pClient = null;
+    if (p2p) { try { await p2p.stop(); } catch {} }
+  }
+
+  let monitors = 1;
+
+  function populateDisplays(count) {
+    displaySelect.innerHTML = "";
+    monitors = count || 1;
+    for (let i = 0; i < monitors; i++) {
+      const opt = document.createElement("option");
+      opt.value = i;
+      opt.textContent = "Display " + (i + 1);
+      displaySelect.appendChild(opt);
+    }
+
+    if (displaySelect.options.length) {
+      displaySelect.value = displaySelect.options[0].value;
+    }
+    applySavedDisplay();
+  }
+
+  async function fetchClientInfo() {
+    try {
+      const res = await fetch("/api/clients");
+      const data = await res.json();
+      const client = data.items.find((c) => c.id === activeClientId);
+      if (client) {
+        clientLabel.textContent = `${client.host || client.id} (${client.os || ""})`;
+      }
+      if (client && client.monitors) {
+        populateDisplays(client.monitors);
+        applySavedDisplay();
+      }
+    } catch (e) {
+      console.warn("failed to fetch client info", e);
+    }
+  }
+
+  refreshBtn.addEventListener("click", fetchClientInfo);
+
+  function updateQualityLabel(val) {
+    if (qualityValue) {
+      qualityValue.textContent = `${val}%`;
+    }
+  }
+
+  function pushQuality(val) {
+    const q = Number(val) || 90;
+    const codec = "jpeg";
+    console.debug("backstage: pushQuality val=", val, "q=", q, "codec=", codec);
+    setCodecModeLabel(codec, "requested");
+    sendCmd("backstage_set_quality", { quality: q, codec });
+  }
+
+  function selectedTargetFps() {
+    const fps = Number(targetFpsSelect?.value || 120);
+    return Number.isFinite(fps) ? Math.max(1, Math.min(240, Math.floor(fps))) : 120;
+  }
+
+  function pushTargetFps() {
+    sendCmd("backstage_set_fps", { fps: selectedTargetFps() });
+  }
+
+  if (targetFpsSelect) {
+    targetFpsSelect.addEventListener("change", function () {
+      pushTargetFps();
+      sharedSettingsSaver.scheduleSave();
+    });
+  }
+
+  function pushTransportQuality(mode) {
+    if (qualitySlider) {
+      pushQuality(qualitySlider.value);
+    }
+  }
+
+  if (codecH264) {
+    codecH264.addEventListener("change", function () {
+      prefersH264 = false;
+      codecH264.checked = false;
+      destroyVideoDecoder();
+      if (qualitySlider) {
+        pushQuality(qualitySlider.value);
+      }
+      sharedSettingsSaver.scheduleSave();
+    });
+  }
+
+  function destroyVideoDecoder() {
+    if (!videoDecoder) return;
+    try {
+      videoDecoder.close();
+    } catch {
+      // Ignore decoder close errors.
+    }
+    videoDecoder = null;
+    h264TimestampUs = 0;
+    h264AwaitingKeyframe = true;
+    h264RecoveryRequestedAt = 0;
+  }
+
+  function requestH264DecoderRecovery(reason) {
+    const now = performance.now();
+    if (now - h264RecoveryRequestedAt < 500) return;
+    h264RecoveryRequestedAt = now;
+    sendCmd("backstage_request_keyframe", { reason });
+  }
+
+  function fallbackToJpegCodec(reason) {
+    if (!prefersH264) return;
+    h264ErrorCount++;
+    prefersH264 = false;
+    destroyVideoDecoder();
+    if (codecH264) codecH264.checked = false;
+    console.warn("backstage: falling back to jpeg codec", reason || "", "errors:", h264ErrorCount);
+    const q = Number(qualitySlider?.value) || 90;
+    setCodecModeLabel("jpeg", "fallback");
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      sendCmd("backstage_set_quality", { quality: q, codec: "jpeg" });
+    }
+    if (h264ErrorCount <= 3 && typeof VideoDecoder === "function") {
+      if (h264RetryTimer) clearTimeout(h264RetryTimer);
+      h264RetryTimer = setTimeout(() => {
+        h264RetryTimer = null;
+        prefersH264 = true;
+        if (codecH264) codecH264.checked = true;
+        setCodecModeLabel("h264", "retry");
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          pushQuality(qualitySlider?.value || 90);
+        }
+      }, 5000);
+    } else if (h264ErrorCount > 3) {
+      sharedSettingsSaver.scheduleSave();
+    }
+  }
+
+  function isH264KeyFrame(data) {
+    for (let i = 0; i + 4 < data.length; i++) {
+      let startCodeLen = 0;
+      if (data[i] === 0x00 && data[i + 1] === 0x00 && data[i + 2] === 0x01) {
+        startCodeLen = 3;
+      } else if (
+        i + 4 < data.length &&
+        data[i] === 0x00 &&
+        data[i + 1] === 0x00 &&
+        data[i + 2] === 0x00 &&
+        data[i + 3] === 0x01
+      ) {
+        startCodeLen = 4;
+      }
+      if (!startCodeLen) continue;
+      const nalIndex = i + startCodeLen;
+      if (nalIndex >= data.length) break;
+      if ((data[nalIndex] & 0x1f) === 5) {
+        return true;
+      }
+      i = nalIndex;
+    }
+    return false;
+  }
+
+  function ensureVideoDecoder() {
+    if (videoDecoder) return true;
+    if (typeof VideoDecoder !== "function") return false;
+    try {
+      videoDecoder = new VideoDecoder({
+        output: (frame) => {
+          const width = frame.displayWidth || frame.codedWidth || canvas.width;
+          const height = frame.displayHeight || frame.codedHeight || canvas.height;
+          if (width > 0 && height > 0 && (canvas.width !== width || canvas.height !== height)) {
+            canvas.width = width;
+            canvas.height = height;
+          }
+          try {
+            ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          } finally {
+            frame.close();
+          }
+        },
+        error: (err) => {
+          console.warn("backstage: h264 decoder error", err);
+          h264AwaitingKeyframe = true;
+          requestH264DecoderRecovery("h264_decoder_error");
+        },
+      });
+      videoDecoder.configure({ codec: "avc1.42E01E", optimizeForLatency: true });
+      return true;
+    } catch (err) {
+      console.warn("backstage: h264 decoder unavailable", err);
+      fallbackToJpegCodec(err);
+      return false;
+    }
+  }
+
+  displaySelect.addEventListener("change", function () {
+    console.debug("backstage: select display", displaySelect.value);
+    sendCmd("backstage_select_display", {
+      display: parseInt(displaySelect.value, 10),
+    });
+    sharedSettingsSaver.scheduleSave();
+  });
+
+  if (webrtcMode) {
+    webrtcMode.addEventListener("change", function () {
+      updateControls();
+      sharedSettingsSaver.scheduleSave();
+    });
+  }
+
+  startBtn.addEventListener("click", function () {
+    const mode = getWebrtcMode();
+    if (displaySelect && displaySelect.value !== undefined) {
+      sendCmd("backstage_select_display", {
+        display: parseInt(displaySelect.value, 10) || 0,
+      });
+    }
+    pushTransportQuality(mode);
+    pushTargetFps();
+    desiredStreaming = true;
+    lastFrameAt = 0;
+    setStreamState("starting", "Starting stream");
+    sendCmd("backstage_start", {
+      autoStartExplorer: false,
+      webrtc: mode === "relayed",
+      ...(virtualMode ? { virtual_mode: true, hidden_mode: true } : {}),
+    });
+    if (mode === "p2p") startP2P();
+    syncInputEnableState();
+  });
+  stopBtn.addEventListener("click", function () {
+    desiredStreaming = false;
+    setStreamState("stopping", "Stopping stream");
+    sendCmd("backstage_stop", {});
+    stopAllWebrtc();
+  });
+  if (killAllBtn) {
+    killAllBtn.addEventListener("click", function () {
+      sendCmd("backstage_kill_all", {});
+    });
+  }
+  fullscreenBtn.addEventListener("click", function () {
+    if (canvasContainer.requestFullscreen) {
+      canvasContainer.requestFullscreen();
+    } else if (canvasContainer.webkitRequestFullscreen) {
+      canvasContainer.webkitRequestFullscreen();
+    } else if (canvasContainer.mozRequestFullScreen) {
+      canvasContainer.mozRequestFullScreen();
+    }
+  });
+  mouseCtrl.addEventListener("change", function () {
+    sendCmd("backstage_enable_mouse", { enabled: mouseCtrl.checked });
+    sharedSettingsSaver.scheduleSave();
+  });
+  kbdCtrl.addEventListener("change", function () {
+    sendCmd("backstage_enable_keyboard", { enabled: kbdCtrl.checked });
+    sharedSettingsSaver.scheduleSave();
+  });
+  if (uiaCtrl) {
+    uiaCtrl.addEventListener("change", function () {
+      sendCmd("backstage_enable_uia", { enabled: uiaCtrl.checked });
+      sharedSettingsSaver.scheduleSave();
+    });
+  }
+  if (printWindowFallbackCtrl) {
+    printWindowFallbackCtrl.addEventListener("change", function () {
+      sendCmd("backstage_enable_printwindow_fallback", { enabled: printWindowFallbackCtrl.checked });
+      sharedSettingsSaver.scheduleSave();
+    });
+  }
+
+  function pushbackstageResolution() {
+    if (backstageResolutionSelect) {
+      const maxHeight = parseInt(backstageResolutionSelect.value, 10);
+      sendCmd("backstage_set_resolution", { maxHeight: maxHeight });
+    }
+  }
+  if (backstageResolutionSelect) {
+    backstageResolutionSelect.addEventListener("change", function () {
+      pushbackstageResolution();
+      sharedSettingsSaver.scheduleSave();
+    });
+  }
+
+  if (qualitySlider) {
+    updateQualityLabel(qualitySlider.value);
+    qualitySlider.addEventListener("input", function () {
+      updateQualityLabel(qualitySlider.value);
+      pushQuality(qualitySlider.value);
+      sharedSettingsSaver.scheduleSave();
+    });
+  }
+
+  function isFramePacket(buf) {
+    return buf.length >= 8 && buf[0] === 0x46 && buf[1] === 0x52 && buf[2] === 0x4d;
+  }
+
+  function markFrameReceived() {
+    lastFrameAt = performance.now();
+    clearOfflineTimer();
+    if (streamState !== "streaming") {
+      desiredStreaming = true;
+      setStreamState("streaming", "Streaming");
+    }
+  }
+
+  function drawJpegFallback(blob, target) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      const url = URL.createObjectURL(blob);
+      img.onload = function () {
+        if (target) {
+          ctx.drawImage(img, target.x, target.y, target.w, target.h);
+        } else {
+          canvas.width = img.width;
+          canvas.height = img.height;
+          ctx.drawImage(img, 0, 0);
+        }
+        URL.revokeObjectURL(url);
+        resolve(true);
+      };
+      img.onerror = function () {
+        URL.revokeObjectURL(url);
+        resolve(false);
+      };
+      img.src = url;
+    });
+  }
+
+  async function drawJpegSlice(slice, target) {
+    const blob = new Blob([slice], { type: "image/jpeg" });
+    try {
+      const bitmap = await createImageBitmap(blob);
+      if (target) {
+        ctx.drawImage(bitmap, target.x, target.y, target.w, target.h);
+      } else {
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+        ctx.drawImage(bitmap, 0, 0);
+      }
+      bitmap.close();
+      return true;
+    } catch {
+      return drawJpegFallback(blob, target);
+    }
+  }
+
+  async function processFrameBuffer(buf) {
+    const fps = buf[5];
+    const format = buf[6];
+
+    if (format === 1) {
+      setCodecModeLabel("jpeg", "active");
+      await drawJpegSlice(buf.slice(8), null);
+      hasCanvasBase = true;
+      updateFpsDisplay(fps);
+      return;
+    }
+
+    if (format === 2 || format === 3) {
+      setCodecModeLabel(format === 3 ? "raw" : "jpeg", "blocks");
+      if (buf.length < 16) return;
+      const dv = new DataView(buf.buffer, 8);
+      let pos = 0;
+      const width = dv.getUint16(pos, true);
+      pos += 2;
+      const height = dv.getUint16(pos, true);
+      pos += 2;
+      const blockCount = dv.getUint16(pos, true);
+      pos += 4;
+
+      if (width > 0 && height > 0 && (canvas.width !== width || canvas.height !== height)) {
+        canvas.width = width;
+        canvas.height = height;
+        hasCanvasBase = false;
+      }
+      if (blockCount > 0 && !hasCanvasBase) {
+        sendCmd("backstage_request_keyframe", { reason: "viewer_missing_base" });
+        return;
+      }
+
+      for (let i = 0; i < blockCount; i++) {
+        if (pos + 12 > dv.byteLength) break;
+        const x = dv.getUint16(pos, true);
+        pos += 2;
+        const y = dv.getUint16(pos, true);
+        pos += 2;
+        const w = dv.getUint16(pos, true);
+        pos += 2;
+        const h = dv.getUint16(pos, true);
+        pos += 2;
+        const len = dv.getUint32(pos, true);
+        pos += 4;
+        const start = 8 + pos;
+        const end = start + len;
+        if (end > buf.length) break;
+        const slice = buf.subarray(start, end);
+        pos += len;
+        if (format === 2) {
+          await drawJpegSlice(slice, { x, y, w, h });
+        } else if (slice.length === w * h * 4) {
+          const imgData = new ImageData(new Uint8ClampedArray(slice), w, h);
+          ctx.putImageData(imgData, x, y);
+        }
+      }
+      updateFpsDisplay(fps);
+      return;
+    }
+
+    if (format === 4) {
+      setCodecModeLabel("h264", "active");
+      const h264Bytes = buf.slice(8);
+      if (!h264Bytes.length) return;
+      if (!ensureVideoDecoder()) {
+        fallbackToJpegCodec("WebCodecs decoder unavailable");
+        return;
+      }
+      const isKeyFrame = isH264KeyFrame(h264Bytes);
+      if (videoDecoder.decodeQueueSize > maxH264DecodeQueue) {
+        videoDecoder.reset();
+        h264TimestampUs = 0;
+        h264AwaitingKeyframe = true;
+        requestH264DecoderRecovery("h264_decoder_backlog");
+      }
+      if (h264AwaitingKeyframe && !isKeyFrame) {
+        requestH264DecoderRecovery("h264_decoder_keyframe_required");
+        return;
+      }
+      if (isKeyFrame) {
+        h264AwaitingKeyframe = false;
+      }
+      const frameIntervalUs = Math.floor(1_000_000 / Math.max(1, fps || 25));
+      const chunk = new EncodedVideoChunk({
+        type: isKeyFrame ? "key" : "delta",
+        timestamp: h264TimestampUs,
+        data: h264Bytes,
+      });
+      h264TimestampUs += frameIntervalUs;
+      try {
+        videoDecoder.decode(chunk);
+        updateFpsDisplay(fps);
+      } catch (err) {
+        console.warn("backstage: h264 decode failed", err);
+        fallbackToJpegCodec(err);
+      }
+    }
+  }
+
+  function flushPendingFrame() {
+    if (frameDecodeBusy || !pendingFrame) return;
+    const next = pendingFrame;
+    pendingFrame = null;
+    frameDecodeBusy = true;
+    processFrameBuffer(next).finally(() => {
+      frameDecodeBusy = false;
+      if (pendingFrame) flushPendingFrame();
+    });
+  }
+
+  function onWsMessage(ev) {
+    if (ev.data instanceof ArrayBuffer) {
+      const buf = new Uint8Array(ev.data);
+      if (isFramePacket(buf)) {
+        markFrameReceived();
+        pendingFrame = buf;
+        flushPendingFrame();
+        return;
+      }
+
+      const msg = decodeMsgpack(buf);
+      if (msg && msg.type === "status" && msg.status) {
+        handleStatus(msg);
+        return;
+      }
+      if (msg && msg.type === "webrtc_ready" && typeof msg.whepPath === "string") {
+        startWhep(msg.whepPath);
+        return;
+      }
+      if (msg && msg.type === "webrtc_p2p_answer" && typeof msg.sdp === "string") {
+        if (p2pClient) p2pClient.onAnswer(msg.sdp);
+        return;
+      }
+      if (msg && msg.type === "webrtc_p2p_ice") {
+        if (p2pClient) p2pClient.onRemoteCandidate(msg);
+        return;
+      }
+      if (msg && msg.type === "backstage_clone_progress") {
+        handleCloneProgress(msg);
+        return;
+      }
+      if (msg && msg.type === "backstage_lookup_result") {
+        handleLookupResult(msg);
+        return;
+      }
+      if (msg && msg.type === "backstage_browser_check_result") {
+        handleBrowserCheckResult(msg);
+        return;
+      }
+      if (msg && msg.type === "backstage_installed_apps_result") {
+        handleInstalledAppsResult(msg);
+        return;
+      }
+      if (msg && msg.type === "backstage_dxgi_status") {
+        handleDXGIStatus(msg);
+        return;
+      }
+      if (msg && msg.type === "backstage_browser_launch_status") {
+        handleBrowserLaunchStatus(msg);
+        return;
+      }
+      if (msg && msg.type === "backstage_window_list_result") {
+        handleWindowListResult(msg);
+        return;
+      }
+      if (msg && msg.type === "backstage_error") {
+        handlebackstageError(msg);
+        return;
+      }
+      if (msg && msg.type === "clipboard_content") {
+        handleClipboardContentMessage(msg);
+        return;
+      }
+      return;
+    }
+
+    const msg = decodeMsgpack(ev.data);
+    if (msg && msg.type === "status" && msg.status) {
+      handleStatus(msg);
+      return;
+    }
+    if (msg && msg.type === "webrtc_ready" && typeof msg.whepPath === "string") {
+      startWhep(msg.whepPath);
+      return;
+    }
+    if (msg && msg.type === "webrtc_p2p_answer" && typeof msg.sdp === "string") {
+      if (p2pClient) p2pClient.onAnswer(msg.sdp);
+      return;
+    }
+    if (msg && msg.type === "webrtc_p2p_ice") {
+      if (p2pClient) p2pClient.onRemoteCandidate(msg);
+      return;
+    }
+    if (msg && msg.type === "backstage_clone_progress") {
+      handleCloneProgress(msg);
+      return;
+    }
+    if (msg && msg.type === "backstage_lookup_result") {
+      handleLookupResult(msg);
+      return;
+    }
+    if (msg && msg.type === "backstage_browser_check_result") {
+      handleBrowserCheckResult(msg);
+      return;
+    }
+    if (msg && msg.type === "backstage_installed_apps_result") {
+      handleInstalledAppsResult(msg);
+      return;
+    }
+    if (msg && msg.type === "backstage_dxgi_status") {
+      handleDXGIStatus(msg);
+      return;
+    }
+    if (msg && msg.type === "backstage_browser_launch_status") {
+      handleBrowserLaunchStatus(msg);
+      return;
+    }
+    if (msg && msg.type === "backstage_error") {
+      console.error("backstage: server error:", msg.error || msg.message);
+      return;
+    }
+    if (msg && msg.type === "clipboard_content") {
+      handleClipboardContentMessage(msg);
+      return;
+    }
+  }
+
+  function onWsOpen() {
+    reconnectDelay = 1000;
+    pushTransportQuality(desiredStreaming ? getWebrtcMode() : "off");
+    clearOfflineTimer();
+    if (desiredStreaming) {
+      setStreamState("starting", "Resuming stream");
+      const mode = getWebrtcMode();
+      if (displaySelect && displaySelect.value !== undefined) {
+        sendCmd("backstage_select_display", { display: parseInt(displaySelect.value, 10) || 0 });
+      }
+      pushTargetFps();
+      sendCmd("backstage_start", { autoStartExplorer: false, webrtc: mode === "relayed", ...(virtualMode ? { virtual_mode: true, hidden_mode: true } : {}) });
+      if (mode === "p2p") startP2P();
+      syncInputEnableState();
+    } else {
+      setStreamState("idle", "Stopped");
+    }
+    fetchClientInfo().then(() => {
+      if (displaySelect && displaySelect.value) {
+        sendCmd("backstage_select_display", { display: parseInt(displaySelect.value, 10) });
+      }
+    });
+    requestBrowserCheck();
+    if (!installedAppsLoading_pending && installedAppsData.length === 0) {
+      requestInstalledApps();
+    }
+  }
+
+  function onWsClose() {
+    destroyVideoDecoder();
+    stopAllWebrtc();
+    if (desiredStreaming) {
+      setStreamState("connecting", "Reconnecting");
+      scheduleReconnect();
+    } else {
+      setStreamState("disconnected", "Disconnected");
+    }
+  }
+
+  function onWsError() {
+    destroyVideoDecoder();
+    stopAllWebrtc();
+    setStreamState("error", "WebSocket error");
+  }
+
+  if (!frameWatchTimer) {
+    frameWatchTimer = setInterval(() => {
+      const now = performance.now();
+      if (desiredStreaming) {
+        if (lastFrameAt && now - lastFrameAt > 2000) {
+          setStreamState("stalled", "No frames");
+        } else if (!lastFrameAt && streamState === "starting") {
+          setStreamState("starting", "Starting stream");
+        }
+      } else if (streamState !== "offline" && streamState !== "disconnected" && streamState !== "error") {
+        if (streamState !== "idle") {
+          setStreamState("idle", "Stopped");
+        }
+      }
+    }, 1000);
+  }
+
+  function getRenderPoint(e) {
+    const surface = e.currentTarget;
+    let rect = surface.getBoundingClientRect();
+    if (!rect.width || !rect.height) {
+      rect = canvasContainer?.getBoundingClientRect() || rect;
+    }
+    const targetW = surface === webrtcVideo
+      ? webrtcVideo.videoWidth
+      : canvas.width;
+    const targetH = surface === webrtcVideo
+      ? webrtcVideo.videoHeight
+      : canvas.height;
+    if (!rect.width || !rect.height || !targetW || !targetH) return null;
+    let x = ((e.clientX - rect.left) / rect.width) * targetW;
+    let y = ((e.clientY - rect.top) / rect.height) * targetH;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    x = Math.max(0, Math.min(targetW - 1, Math.floor(x)));
+    y = Math.max(0, Math.min(targetH - 1, Math.floor(y)));
+    return { x, y };
+  }
+
+  function scheduleMouseMove() {
+    if (!moveFrame) {
+      moveFrame = requestAnimationFrame(flushMouseMove);
+    }
+  }
+
+  function flushMouseMove() {
+    moveFrame = 0;
+    if (!desiredStreaming || !pendingMove || !mouseCtrl.checked) return;
+    if (ws.bufferedAmount <= inputBackpressureBytes) {
+      sendCmd("backstage_mouse_move", pendingMove);
+    }
+  }
+
+  for (const inputSurface of [canvas, webrtcVideo]) {
+    if (!inputSurface) continue;
+    inputSurface.addEventListener("mousemove", function (e) {
+      if (!desiredStreaming || !mouseCtrl.checked) return;
+      const pt = getRenderPoint(e);
+      if (!pt) return;
+      pendingMove = pt;
+      scheduleMouseMove();
+    });
+    inputSurface.addEventListener("mousedown", function (e) {
+      canvasContainer.focus({ preventScroll: true });
+      if (!desiredStreaming || !mouseCtrl.checked) return;
+      const pt = getRenderPoint(e);
+      if (pt) {
+        pendingMove = pt;
+        if (ws.bufferedAmount <= inputBackpressureBytes) {
+          sendCmd("backstage_mouse_move", pt);
+        }
+      }
+      sendCmd("backstage_mouse_down", { button: e.button, ...(pt || {}) });
+      e.preventDefault();
+    });
+    inputSurface.addEventListener("mouseup", function (e) {
+      if (!desiredStreaming || !mouseCtrl.checked) return;
+      const pt = getRenderPoint(e);
+      if (pt) {
+        pendingMove = pt;
+        if (ws.bufferedAmount <= inputBackpressureBytes) {
+          sendCmd("backstage_mouse_move", pt);
+        }
+      }
+      sendCmd("backstage_mouse_up", { button: e.button, ...(pt || {}) });
+      e.preventDefault();
+    });
+    inputSurface.addEventListener("contextmenu", function (e) {
+      if (desiredStreaming && mouseCtrl.checked) e.preventDefault();
+    });
+    inputSurface.addEventListener("wheel", function (e) {
+      if (!desiredStreaming || !mouseCtrl.checked) return;
+      const pt = getRenderPoint(e);
+      if (!pt) return;
+      const delta = Math.max(-120, Math.min(120, Math.round(-e.deltaY)));
+      sendCmd("backstage_mouse_wheel", { delta, x: pt.x, y: pt.y });
+      e.preventDefault();
+    }, { passive: false });
+    inputSurface.addEventListener("click", function () {
+      canvasContainer.focus({ preventScroll: true });
+    });
+  }
+  canvasContainer.setAttribute("tabindex", "0");
+  const kbdCapture = createKeyboardCapture({
+    container: canvasContainer,
+    sendKeyDown: (e) => {
+      if (!desiredStreaming) return;
+      const altGraph = typeof e.getModifierState === "function" && e.getModifierState("AltGraph");
+      const printable = typeof e.key === "string"
+        && Array.from(e.key).length === 1
+        && (!e.ctrlKey && !e.metaKey && !e.altKey || altGraph);
+      sendCmd("backstage_key_down", {
+        key: e.key,
+        code: e.code,
+        text: printable ? e.key : "",
+      });
+    },
+    sendKeyUp: (e) => {
+      if (desiredStreaming) sendCmd("backstage_key_up", { key: e.key, code: e.code });
+    },
+  });
+  if (kbdCtrl) {
+    kbdCtrl.addEventListener("change", function () {
+      if (kbdCtrl.checked) kbdCapture.enable();
+      else kbdCapture.disable();
+    });
+    if (kbdCtrl.checked) kbdCapture.enable();
+  }
+  document.addEventListener("fullscreenchange", function () {
+    if (document.fullscreenElement === canvasContainer && kbdCtrl && !kbdCtrl.checked) {
+      kbdCtrl.checked = true;
+      kbdCtrl.dispatchEvent(new Event("change"));
+    }
+  });
+
+  function stopOnExit() {
+    sharedSettingsSaver.saveNow();
+    if (ws && ws.readyState === WebSocket.OPEN && desiredStreaming) {
+      desiredStreaming = false;
+      sendCmd("backstage_stop", {});
+    }
+    destroyVideoDecoder();
+    stopAllWebrtc();
+  }
+
+  window.addEventListener("beforeunload", stopOnExit);
+  window.addEventListener("pagehide", stopOnExit);
+
+  function hideContextMenu() {
+    if (!contextMenu) return;
+    contextMenu.classList.add("hidden");
+  }
+
+  function showContextMenuAt(x, y) {
+    if (!contextMenu) return;
+    contextMenu.style.left = `${x}px`;
+    contextMenu.style.top = `${y}px`;
+    contextMenu.classList.remove("hidden");
+  }
+
+  document.addEventListener("click", (e) => {
+    if (!contextMenu) return;
+    if (commandsBtn && commandsBtn.contains(e.target)) {
+      return;
+    }
+    if (!contextMenu.contains(e.target)) {
+      hideContextMenu();
+    }
+  });
+
+  if (commandsBtn) {
+    commandsBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const rect = commandsBtn.getBoundingClientRect();
+      showContextMenuAt(rect.left, rect.bottom + 6);
+    });
+  }
+
+  ["backstageCloneToggle", "backstageCloneLiteToggle", "backstageKillIfRunningToggle", "backstageInjectionMethod"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.addEventListener("change", function () {
+        sharedSettingsSaver.scheduleSave();
+      });
+    }
+  });
+
+  if (contextMenu) {
+    contextMenu.querySelectorAll("[data-action]").forEach((item) => {
+      item.addEventListener("click", (e) => {
+        const action = e.currentTarget?.dataset?.action;
+        if (action === "start-cmd") {
+          sendCmd("backstage_start_process", { path: "conhost cmd.exe" });
+        } else if (action === "start-powershell") {
+          sendCmd("backstage_start_process", { path: "conhost powershell.exe" });
+        } else if (action === "start-chrome") {
+          const clone = document.getElementById("backstageCloneToggle")?.checked !== false;
+          const cloneLite = document.getElementById("backstageCloneLiteToggle")?.checked === true;
+          const killIfRunning = document.getElementById("backstageKillIfRunningToggle")?.checked !== false;
+          sendCmd("backstage_start_browser_injected", { browser: "chrome", clone, cloneLite, killIfRunning, injectionMethod: readInjectionMethod() });
+        } else if (action === "start-brave") {
+          const clone = document.getElementById("backstageCloneToggle")?.checked !== false;
+          const cloneLite = document.getElementById("backstageCloneLiteToggle")?.checked === true;
+          const killIfRunning = document.getElementById("backstageKillIfRunningToggle")?.checked !== false;
+          sendCmd("backstage_start_browser_injected", { browser: "brave", clone, cloneLite, killIfRunning, injectionMethod: readInjectionMethod() });
+        } else if (action === "start-edge") {
+          const clone = document.getElementById("backstageCloneToggle")?.checked !== false;
+          const cloneLite = document.getElementById("backstageCloneLiteToggle")?.checked === true;
+          const killIfRunning = document.getElementById("backstageKillIfRunningToggle")?.checked !== false;
+          sendCmd("backstage_start_browser_injected", { browser: "edge", clone, cloneLite, killIfRunning, injectionMethod: readInjectionMethod() });
+        } else if (action === "start-firefox") {
+          const clone = document.getElementById("backstageCloneToggle")?.checked !== false;
+          const cloneLite = document.getElementById("backstageCloneLiteToggle")?.checked === true;
+          const killIfRunning = document.getElementById("backstageKillIfRunningToggle")?.checked !== false;
+          sendCmd("backstage_start_browser_injected", { browser: "firefox", clone, cloneLite, killIfRunning, injectionMethod: readInjectionMethod() });
+        } else if (action === "start-opera") {
+          const clone = document.getElementById("backstageCloneToggle")?.checked !== false;
+          const cloneLite = document.getElementById("backstageCloneLiteToggle")?.checked === true;
+          const killIfRunning = document.getElementById("backstageKillIfRunningToggle")?.checked !== false;
+          sendCmd("backstage_start_browser_injected", { browser: "opera", clone, cloneLite, killIfRunning, injectionMethod: readInjectionMethod() });
+        } else if (action === "start-operagx") {
+          const clone = document.getElementById("backstageCloneToggle")?.checked !== false;
+          const cloneLite = document.getElementById("backstageCloneLiteToggle")?.checked === true;
+          const killIfRunning = document.getElementById("backstageKillIfRunningToggle")?.checked !== false;
+          sendCmd("backstage_start_browser_injected", { browser: "operagx", clone, cloneLite, killIfRunning, injectionMethod: readInjectionMethod() });
+        } else if (action === "start-vivaldi") {
+          const clone = document.getElementById("backstageCloneToggle")?.checked !== false;
+          const cloneLite = document.getElementById("backstageCloneLiteToggle")?.checked === true;
+          const killIfRunning = document.getElementById("backstageKillIfRunningToggle")?.checked !== false;
+          sendCmd("backstage_start_browser_injected", { browser: "vivaldi", clone, cloneLite, killIfRunning, injectionMethod: readInjectionMethod() });
+        } else if (action === "start-yandex") {
+          const clone = document.getElementById("backstageCloneToggle")?.checked !== false;
+          const cloneLite = document.getElementById("backstageCloneLiteToggle")?.checked === true;
+          const killIfRunning = document.getElementById("backstageKillIfRunningToggle")?.checked !== false;
+          sendCmd("backstage_start_browser_injected", { browser: "yandex", clone, cloneLite, killIfRunning, injectionMethod: readInjectionMethod() });
+        } else if (action === "start-waterfox") {
+          const clone = document.getElementById("backstageCloneToggle")?.checked !== false;
+          const cloneLite = document.getElementById("backstageCloneLiteToggle")?.checked === true;
+          const killIfRunning = document.getElementById("backstageKillIfRunningToggle")?.checked !== false;
+          sendCmd("backstage_start_browser_injected", { browser: "waterfox", clone, cloneLite, killIfRunning, injectionMethod: readInjectionMethod() });
+        } else if (action === "start-arc") {
+          const clone = document.getElementById("backstageCloneToggle")?.checked !== false;
+          const cloneLite = document.getElementById("backstageCloneLiteToggle")?.checked === true;
+          const killIfRunning = document.getElementById("backstageKillIfRunningToggle")?.checked !== false;
+          sendCmd("backstage_start_browser_injected", { browser: "arc", clone, cloneLite, killIfRunning, injectionMethod: readInjectionMethod() });
+        } else if (action === "start-custom") {
+          hideContextMenu();
+          showCustomExeModal();
+          return;
+        } else if (action === "lookup-exe") {
+          hideContextMenu();
+          showLookupExeModal();
+          return;
+        }
+        hideContextMenu();
+      });
+    });
+  }
+
+  function showCustomExeModal() {
+    let overlay = document.getElementById("backstageCustomExeOverlay");
+    if (overlay) { overlay.remove(); }
+    overlay = document.createElement("div");
+    overlay.id = "backstageCustomExeOverlay";
+    overlay.className = "fixed inset-0 z-[100] flex items-center justify-center bg-black/60";
+    overlay.innerHTML = `
+      <div class="bg-slate-900 border border-slate-700 rounded-xl p-5 w-96 shadow-2xl">
+        <div class="text-sm font-semibold text-slate-100 mb-3">Run Custom Executable</div>
+        <label class="block text-xs text-slate-400 mb-1">Exe path</label>
+        <input id="backstageCustomExePath" type="text" placeholder="C:\\path\\to\\app.exe"
+          class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-slate-100 mb-3 focus:outline-none focus:border-violet-500" />
+        <label class="block text-xs text-slate-400 mb-1">Arguments (optional)</label>
+        <input id="backstageCustomExeArgs" type="text" placeholder="--flag value"
+          class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-slate-100 mb-3 focus:outline-none focus:border-violet-500" />
+        <label class="flex items-center gap-2 text-xs text-slate-400 mb-4 cursor-pointer select-none">
+          <input id="backstageCustomExeOperaPatch" type="checkbox"
+            class="accent-violet-500 w-3.5 h-3.5 rounded" />
+          Apply Opera patch (stub GetCursorInfo)
+        </label>
+        <div class="flex justify-end gap-2">
+          <button id="backstageCustomExeCancel" class="button ghost text-sm">Cancel</button>
+          <button id="backstageCustomExeRun" class="button primary text-sm">Run</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const pathInput = document.getElementById("backstageCustomExePath");
+    const argsInput = document.getElementById("backstageCustomExeArgs");
+    pathInput.focus();
+    function close() { overlay.remove(); }
+    document.getElementById("backstageCustomExeCancel").addEventListener("click", close);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+    function run() {
+      const exePath = pathInput.value.trim();
+      if (!exePath) return;
+      const args = argsInput.value.trim();
+      const cmd = args ? `"${exePath}" ${args}` : `"${exePath}"`;
+      const operaPatch = document.getElementById("backstageCustomExeOperaPatch").checked;
+      sendCmd("backstage_start_process", { path: cmd, opera_patch: operaPatch });
+      close();
+    }
+    document.getElementById("backstageCustomExeRun").addEventListener("click", run);
+    pathInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); argsInput.focus(); } });
+    argsInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); run(); } });
+  }
+
+  let activeLookupOverlay = null;
+
+  function showLookupExeModal() {
+    if (activeLookupOverlay) activeLookupOverlay.remove();
+    const overlay = document.createElement("div");
+    overlay.id = "backstageLookupExeOverlay";
+    overlay.className = "fixed inset-0 z-[100] flex items-center justify-center bg-black/60";
+    overlay.innerHTML = `
+      <div class="bg-slate-900 border border-slate-700 rounded-xl p-5 w-[480px] shadow-2xl flex flex-col" style="max-height:80vh">
+        <div class="text-sm font-semibold text-slate-100 mb-3">Lookup Executable</div>
+        <label class="block text-xs text-slate-400 mb-1">Exe filename (e.g. notepad.exe)</label>
+        <div class="flex gap-2 mb-3">
+          <input id="backstageLookupExeName" type="text" placeholder="notepad.exe"
+            class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-violet-500" />
+          <button id="backstageLookupBtn" class="button primary text-sm px-4">
+            <i class="fa-solid fa-magnifying-glass mr-1"></i>Lookup
+          </button>
+        </div>
+        <div id="backstageLookupStatus" class="text-xs text-slate-500 mb-2 hidden">
+          <i class="fa-solid fa-spinner fa-spin mr-1"></i>Searching…
+        </div>
+        <div id="backstageLookupResults" class="flex-1 overflow-y-auto min-h-[60px] max-h-[400px] bg-slate-950 border border-slate-800 rounded p-2">
+          <div class="text-xs text-slate-600 text-center py-4">Results will appear here</div>
+        </div>
+        <div class="flex items-center mt-3">
+          <label class="flex items-center gap-2 cursor-pointer select-none">
+            <input type="checkbox" id="backstageLookupKill" class="accent-red-500 w-4 h-4 rounded" />
+            <span class="text-xs text-slate-300">Kill before starting</span>
+          </label>
+          <div class="ml-auto">
+            <button id="backstageLookupClose" class="button ghost text-sm">Close</button>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    activeLookupOverlay = overlay;
+
+    const nameInput = document.getElementById("backstageLookupExeName");
+    const lookupBtn = document.getElementById("backstageLookupBtn");
+    const statusEl = document.getElementById("backstageLookupStatus");
+    const resultsEl = document.getElementById("backstageLookupResults");
+    nameInput.focus();
+
+    function close() { overlay.remove(); activeLookupOverlay = null; }
+    document.getElementById("backstageLookupClose").addEventListener("click", close);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+
+    function startLookup() {
+      const exe = nameInput.value.trim();
+      if (!exe) return;
+      resultsEl.innerHTML = "";
+      statusEl.classList.remove("hidden");
+      lookupBtn.disabled = true;
+      lookupBtn.classList.add("opacity-50");
+      sendCmd("backstage_lookup", { exe });
+    }
+
+    lookupBtn.addEventListener("click", startLookup);
+    nameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); startLookup(); } });
+  }
+
+  function handleLookupResult(msg) {
+    const overlay = activeLookupOverlay;
+    if (!overlay) return;
+    const statusEl = document.getElementById("backstageLookupStatus");
+    const resultsEl = document.getElementById("backstageLookupResults");
+    const lookupBtn = document.getElementById("backstageLookupBtn");
+    if (!resultsEl) return;
+
+    if (msg?.done) {
+      if (statusEl) {
+        statusEl.innerHTML = '<i class="fa-solid fa-check mr-1 text-emerald-400"></i>Search complete';
+        setTimeout(() => statusEl.classList.add("hidden"), 3000);
+      }
+      if (lookupBtn) {
+        lookupBtn.disabled = false;
+        lookupBtn.classList.remove("opacity-50");
+      }
+      if (!resultsEl.querySelector("[data-lookup-path]")) {
+        resultsEl.innerHTML = '<div class="text-xs text-slate-500 text-center py-4">No results found</div>';
+      }
+      return;
+    }
+
+    const lookupPath = safeClientString(msg?.path, "", 32768);
+    if (lookupPath) {
+      // Remove placeholder if present
+      const placeholder = resultsEl.querySelector(":scope > div:not([data-lookup-path])");
+      if (placeholder) placeholder.remove();
+
+      const item = document.createElement("button");
+      item.type = "button";
+      item.dataset.lookupPath = lookupPath;
+      item.className = "w-full text-left px-2 py-1.5 rounded text-xs text-slate-200 hover:bg-violet-600/30 hover:text-violet-100 transition-colors font-mono truncate block";
+      item.textContent = lookupPath;
+      item.title = "Click to start in backstage: " + lookupPath;
+      item.addEventListener("click", () => {
+        const killCheckbox = document.getElementById("backstageLookupKill");
+        const killExe = killCheckbox?.checked
+          ? safeClientString(msg?.exe, "", 1024)
+          : "";
+        sendCmd("backstage_start_process", { path: '"' + lookupPath + '"', kill_exe: killExe });
+        item.classList.add("text-emerald-400");
+        const icon = document.createElement("i");
+        icon.className = "fa-solid fa-check mr-1";
+        item.replaceChildren(
+          icon,
+          document.createTextNode((killExe ? "(killed) " : "") + lookupPath),
+        );
+      });
+      resultsEl.appendChild(item);
+      item.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  function updateLatencyDisplay(ms) {
+    lastLatencyMs = ms;
+    if (latencyEl) {
+      latencyEl.textContent = `${Math.round(ms)}ms`;
+    }
+  }
+
+  // ── Window Map ──────────────────────────────────────────────
+  const windowMapBtn = document.getElementById("windowMapBtn");
+  const windowMapModal = document.getElementById("windowMapModal");
+  const windowMapCloseBtn = document.getElementById("windowMapCloseBtn");
+  const windowMapRefreshBtn = document.getElementById("windowMapRefreshBtn");
+  const windowMapCanvas = document.getElementById("windowMapCanvas");
+  const windowMapList = document.getElementById("windowMapList");
+
+  const WINDOW_COLORS = [
+    "#8b5cf6", "#3b82f6", "#10b981", "#f59e0b", "#ef4444",
+    "#ec4899", "#06b6d4", "#84cc16", "#f97316", "#6366f1",
+  ];
+
+  const WINDOW_MAP_MAX_MONITORS = 64;
+  const WINDOW_MAP_MAX_WINDOWS = 2000;
+  const WINDOW_MAP_MAX_COORDINATE = 1000000;
+  const WINDOW_MAP_MAX_DIMENSION = 100000;
+
+  function safeClientString(value, fallback = "", maxLength = 1024) {
+    let text;
+    try {
+      text = String(value ?? fallback);
+    } catch {
+      text = String(fallback);
+    }
+    return text.slice(0, maxLength);
+  }
+
+  clipboardFromUserBtn?.addEventListener("click", () => {
+    clipboardPullPending = true;
+    setClipboardStatus("Requesting clipboard from user…");
+    sendCmd("clipboard_pull", {});
+    setTimeout(() => {
+      if (!clipboardPullPending) return;
+      clipboardPullPending = false;
+      setClipboardStatus("No clipboard response received.", true);
+    }, 5000);
+  });
+  clipboardToUserBtn?.addEventListener("click", async () => {
+    let text;
+    try {
+      text = await navigator.clipboard.readText();
+      if (clipboardText) clipboardText.value = text;
+    } catch {
+      setClipboardStatus("Browser clipboard access is blocked. Allow clipboard permission and try again.", true);
+      return;
+    }
+    if (!clipboardTextFits(text)) {
+      setClipboardStatus("Clipboard text is larger than the 64 KiB sync limit.", true);
+      return;
+    }
+    sendCmd("clipboard_push", { text });
+    lastClipboardText = text;
+    setClipboardStatus("Copied to user.");
+  });
+
+  function boundedClientNumber(value, min, max, fallback = 0) {
+    let number;
+    try {
+      number = Number(value);
+    } catch {
+      return fallback;
+    }
+    if (!Number.isFinite(number)) return fallback;
+    return Math.min(max, Math.max(min, number));
+  }
+
+  function boundedClientInteger(value, min, max, fallback = 0) {
+    return Math.trunc(boundedClientNumber(value, min, max, fallback));
+  }
+
+  function normalizeWindowMapPayload(msg) {
+    const monitorValues = Array.isArray(msg?.monitors)
+      ? msg.monitors.slice(0, WINDOW_MAP_MAX_MONITORS)
+      : [];
+    const windowValues = Array.isArray(msg?.windows)
+      ? msg.windows.slice(0, WINDOW_MAP_MAX_WINDOWS)
+      : [];
+
+    const monitors = monitorValues.map((value, position) => {
+      const monitor = value && typeof value === "object" ? value : {};
+      return {
+        index: boundedClientInteger(
+          monitor.index,
+          -WINDOW_MAP_MAX_COORDINATE,
+          WINDOW_MAP_MAX_COORDINATE,
+          position,
+        ),
+        name: safeClientString(monitor.name, "", 1024),
+        x: boundedClientNumber(
+          monitor.x,
+          -WINDOW_MAP_MAX_COORDINATE,
+          WINDOW_MAP_MAX_COORDINATE,
+        ),
+        y: boundedClientNumber(
+          monitor.y,
+          -WINDOW_MAP_MAX_COORDINATE,
+          WINDOW_MAP_MAX_COORDINATE,
+        ),
+        width: boundedClientNumber(
+          monitor.width,
+          0,
+          WINDOW_MAP_MAX_DIMENSION,
+        ),
+        height: boundedClientNumber(
+          monitor.height,
+          0,
+          WINDOW_MAP_MAX_DIMENSION,
+        ),
+        primary: monitor.primary === true,
+      };
+    });
+
+    const windows = windowValues.map((value) => {
+      const windowValue = value && typeof value === "object" ? value : {};
+      return {
+        title: safeClientString(windowValue.title, "", 2048),
+        processName: safeClientString(windowValue.processName, "", 1024),
+        pid: boundedClientInteger(windowValue.pid, 0, 0xffffffff, 0),
+        x: boundedClientNumber(
+          windowValue.x,
+          -WINDOW_MAP_MAX_COORDINATE,
+          WINDOW_MAP_MAX_COORDINATE,
+        ),
+        y: boundedClientNumber(
+          windowValue.y,
+          -WINDOW_MAP_MAX_COORDINATE,
+          WINDOW_MAP_MAX_COORDINATE,
+        ),
+        width: boundedClientNumber(
+          windowValue.width,
+          0,
+          WINDOW_MAP_MAX_DIMENSION,
+        ),
+        height: boundedClientNumber(
+          windowValue.height,
+          0,
+          WINDOW_MAP_MAX_DIMENSION,
+        ),
+        monitor: boundedClientInteger(
+          windowValue.monitor,
+          -1,
+          WINDOW_MAP_MAX_MONITORS - 1,
+          -1,
+        ),
+      };
+    });
+
+    return { monitors, windows };
+  }
+
+  function setWindowMapPlaceholder(element, text, { canvas = false, spinner = false } = {}) {
+    if (!element) return;
+    const wrapper = document.createElement("div");
+    wrapper.className = canvas
+      ? "flex items-center justify-center h-40 text-slate-500 text-sm"
+      : "text-slate-500 text-xs text-center py-2";
+    if (spinner) {
+      const icon = document.createElement("i");
+      icon.className = "fa-solid fa-spinner fa-spin mr-2";
+      wrapper.appendChild(icon);
+    }
+    wrapper.appendChild(document.createTextNode(text));
+    element.replaceChildren(wrapper);
+  }
+
+  function createWindowMapSpan(className, text = "") {
+    const span = document.createElement("span");
+    span.className = className;
+    span.textContent = safeClientString(text, "", 4096);
+    return span;
+  }
+
+  function openWindowMap() {
+    if (!windowMapModal) return;
+    windowMapModal.style.display = "flex";
+    sendCmd("backstage_window_list", {});
+    setWindowMapPlaceholder(windowMapCanvas, "Loading…", { canvas: true, spinner: true });
+    windowMapList?.replaceChildren();
+  }
+
+  function closeWindowMap() {
+    if (windowMapModal) windowMapModal.style.display = "none";
+  }
+
+  if (windowMapBtn) windowMapBtn.addEventListener("click", openWindowMap);
+  if (windowMapCloseBtn) windowMapCloseBtn.addEventListener("click", closeWindowMap);
+  if (windowMapRefreshBtn) windowMapRefreshBtn.addEventListener("click", () => {
+    sendCmd("backstage_window_list", {});
+    setWindowMapPlaceholder(windowMapCanvas, "Refreshing…", { canvas: true, spinner: true });
+    windowMapList?.replaceChildren();
+  });
+  if (windowMapModal) windowMapModal.addEventListener("click", (e) => {
+    if (e.target === windowMapModal) closeWindowMap();
+  });
+
+  function handleWindowListResult(msg) {
+    const { monitors, windows } = normalizeWindowMapPayload(msg);
+
+    if (!windowMapCanvas || !windowMapList) return;
+
+    if (monitors.length === 0 && windows.length === 0) {
+      setWindowMapPlaceholder(windowMapCanvas, "No windows or monitors found", { canvas: true });
+      setWindowMapPlaceholder(windowMapList, "No visible windows on the hidden desktop");
+      return;
+    }
+
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const m of monitors) {
+      minX = Math.min(minX, m.x);
+      minY = Math.min(minY, m.y);
+      maxX = Math.max(maxX, m.x + m.width);
+      maxY = Math.max(maxY, m.y + m.height);
+    }
+    for (const w of windows) {
+      minX = Math.min(minX, w.x);
+      minY = Math.min(minY, w.y);
+      maxX = Math.max(maxX, w.x + w.width);
+      maxY = Math.max(maxY, w.y + w.height);
+    }
+    if (!isFinite(minX)) { minX = 0; minY = 0; maxX = 1920; maxY = 1080; }
+
+    const totalW = maxX - minX || 1;
+    const totalH = maxY - minY || 1;
+    const containerW = windowMapCanvas.clientWidth || 800;
+    const aspect = totalW / totalH;
+    const mapH = Math.min(400, Math.max(180, containerW / aspect));
+    const scale = Math.min(containerW / totalW, mapH / totalH) * 0.92;
+    const padX = (containerW - totalW * scale) / 2;
+    const padY = (mapH - totalH * scale) / 2;
+
+    function tx(x) { return padX + (x - minX) * scale; }
+    function ty(y) { return padY + (y - minY) * scale; }
+    function tw(w) { return w * scale; }
+
+    windowMapCanvas.style.height = mapH + "px";
+    const canvasFragment = document.createDocumentFragment();
+
+    for (let i = 0; i < monitors.length; i++) {
+      const m = monitors[i];
+      const x = tx(m.x), y = ty(m.y), w = tw(m.width), h = tw(m.height);
+      const monitorBox = document.createElement("div");
+      monitorBox.className = "absolute border-2 border-dashed border-slate-600 rounded";
+      monitorBox.style.left = `${x}px`;
+      monitorBox.style.top = `${y}px`;
+      monitorBox.style.width = `${w}px`;
+      monitorBox.style.height = `${h}px`;
+      monitorBox.title = `Monitor ${m.index}: ${m.name} (${m.width}x${m.height})`;
+      monitorBox.append(
+        createWindowMapSpan(
+          "absolute top-1 left-1.5 text-[10px] font-mono text-slate-500",
+          `${m.primary ? "★ " : ""}${m.name || "Monitor " + m.index}`,
+        ),
+        createWindowMapSpan(
+          "absolute bottom-1 right-1.5 text-[10px] font-mono text-slate-600",
+          `${m.width}×${m.height}`,
+        ),
+      );
+      canvasFragment.appendChild(monitorBox);
+    }
+
+    for (let i = 0; i < windows.length; i++) {
+      const mappedWindow = windows[i];
+      const color = WINDOW_COLORS[i % WINDOW_COLORS.length];
+      const x = tx(mappedWindow.x), y = ty(mappedWindow.y);
+      const width = Math.max(tw(mappedWindow.width), 8);
+      const height = Math.max(tw(mappedWindow.height), 8);
+      const shortTitle = mappedWindow.title.length > 30
+        ? mappedWindow.title.slice(0, 28) + "…"
+        : mappedWindow.title;
+      const windowBox = document.createElement("div");
+      windowBox.className = "absolute rounded border overflow-hidden cursor-default";
+      windowBox.style.left = `${x}px`;
+      windowBox.style.top = `${y}px`;
+      windowBox.style.width = `${width}px`;
+      windowBox.style.height = `${height}px`;
+      windowBox.style.borderColor = color;
+      windowBox.style.background = `${color}18`;
+      windowBox.title = [
+        mappedWindow.title,
+        `${mappedWindow.processName} (PID ${mappedWindow.pid})`,
+        `Position: ${mappedWindow.x},${mappedWindow.y} Size: ${mappedWindow.width}×${mappedWindow.height}`,
+        `Monitor: ${mappedWindow.monitor >= 0 ? mappedWindow.monitor : "none"}`,
+      ].join("\n");
+      if (height > 20 && width > 50) {
+        const title = document.createElement("div");
+        title.className = "px-1 py-0.5 text-[9px] font-mono text-slate-200 truncate";
+        title.style.background = `${color}50`;
+        title.textContent = shortTitle;
+        windowBox.appendChild(title);
+      }
+      canvasFragment.appendChild(windowBox);
+    }
+
+    windowMapCanvas.replaceChildren(canvasFragment);
+
+    if (windows.length === 0) {
+      setWindowMapPlaceholder(windowMapList, "No visible windows on the hidden desktop");
+      return;
+    }
+
+    const list = document.createElement("div");
+    list.className = "grid gap-1";
+    const header = document.createElement("div");
+    header.className = "grid grid-cols-[auto_1fr_auto_auto_auto] gap-x-3 px-2 py-1 text-[11px] uppercase tracking-wide text-slate-500 border-b border-slate-800";
+    header.append(
+      createWindowMapSpan("", ""),
+      createWindowMapSpan("", "Title"),
+      createWindowMapSpan("", "Process"),
+      createWindowMapSpan("", "Position"),
+      createWindowMapSpan("", "Monitor"),
+    );
+    list.appendChild(header);
+
+    for (let i = 0; i < windows.length; i++) {
+      const mappedWindow = windows[i];
+      const color = WINDOW_COLORS[i % WINDOW_COLORS.length];
+      const monitorLabel = mappedWindow.monitor >= 0
+        ? (monitors[mappedWindow.monitor]?.name || `#${mappedWindow.monitor}`)
+        : "—";
+      const row = document.createElement("div");
+      row.className = "grid grid-cols-[auto_1fr_auto_auto_auto] gap-x-3 items-center px-2 py-1.5 rounded hover:bg-slate-800/50 text-xs text-slate-300";
+
+      const colorMarker = createWindowMapSpan("w-2.5 h-2.5 rounded-sm", "");
+      colorMarker.style.background = color;
+      const title = createWindowMapSpan("truncate font-medium", mappedWindow.title);
+      title.title = mappedWindow.title;
+      const process = createWindowMapSpan("font-mono text-slate-400", mappedWindow.processName + " ");
+      process.appendChild(createWindowMapSpan("text-slate-600", `(${mappedWindow.pid})`));
+      row.append(
+        colorMarker,
+        title,
+        process,
+        createWindowMapSpan(
+          "font-mono text-slate-500",
+          `${mappedWindow.x},${mappedWindow.y} ${mappedWindow.width}×${mappedWindow.height}`,
+        ),
+        createWindowMapSpan(
+          `font-mono ${mappedWindow.monitor >= 0 ? "text-slate-300" : "text-rose-400"}`,
+          monitorLabel,
+        ),
+      );
+      list.appendChild(row);
+    }
+    windowMapList.replaceChildren(list);
+  }
+
+  connectWs();
+  fetchClientInfo();
+})();

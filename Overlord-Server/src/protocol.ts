@@ -1,0 +1,538 @@
+import { encode, decode } from "@msgpack/msgpack";
+import { preflightMessagePack } from "./messagepack-preflight";
+import {
+  getImplicitCommandVersion,
+  isCommandType,
+  type CommandType,
+  type CommandVersionRange,
+  type MessageKind,
+} from "./generated/wire-contract";
+export type {
+  CommandType,
+  CommandVersionRange,
+  MessageKind,
+} from "./generated/wire-contract";
+
+export type Hello = {
+  type: "hello";
+  id: string;
+  host: string;
+  os: string;
+  arch: string;
+  hostArch?: string;
+  version: string;
+  user: string;
+  monitors: number;
+  monitorInfo?: { width: number; height: number }[];
+  country?: string;
+  hwid?: string;
+  inMemory?: boolean;
+  cpu?: string;
+  gpu?: string;
+  ram?: string;
+  batteryPercent?: number;
+  batteryCharging?: boolean;
+  isAdmin?: boolean;
+  elevation?: string;
+  permissions?: Record<string, boolean>;
+  publicKey?: string;
+  signature?: string;
+  publicIP?: string;
+  lastCrashReason?: string;
+  lastCrashDetail?: string;
+  protocolVersion?: number;
+  commandVersions?: Partial<Record<CommandType, CommandVersionRange>>;
+};
+
+export type EnrollmentChallenge = {
+  type: "enrollment_challenge";
+  nonce: string;
+};
+
+export type EnrollmentStatusMsg = {
+  type: "enrollment_status";
+  status: "pending" | "approved" | "denied";
+};
+
+export type HelloAck = {
+  type: "hello_ack";
+  id: string;
+  protocolVersion?: number;
+  commandVersions?: Partial<Record<CommandType, number>>;
+  commands?: Command[];
+  notification?: {
+    keywords: string[];
+    minIntervalMs?: number;
+    clipboardEnabled?: boolean;
+  };
+};
+export type Ping = { type: "ping"; ts?: number };
+export type Pong = { type: "pong"; ts?: number };
+
+export type Command = {
+  type: "command";
+  commandType: CommandType;
+  commandVersion?: number;
+  payload?: unknown;
+  id?: string;
+};
+
+export type CommandResult = {
+  type: "command_result";
+  commandId?: string;
+  commandType?: CommandType;
+  commandVersion?: number;
+  ok: boolean;
+  message?: string;
+  errorCode?: "unsupported_command_version" | string;
+  supportedVersions?: CommandVersionRange;
+};
+
+export type DesktopCodecCapability = {
+  codec: "hevc" | "h264" | "jpeg" | "raw" | string;
+  encoders?: string[];
+  transports: Array<"websocket" | "webrtc" | string>;
+  hardware?: boolean;
+};
+
+export type DesktopEncoderCapabilities = {
+  type: "desktop_encoder_capabilities";
+  commandId?: string;
+  probed: boolean;
+  display: number;
+  profiles: Array<{
+    maxHeight: number;
+    width: number;
+    height: number;
+    fps: number;
+    label: string;
+    providers: string[];
+  }>;
+  codecs: DesktopCodecCapability[];
+  detail?: string;
+};
+
+export type ClientLogEntry = {
+  seq: number;
+  at: number;
+  source: string;
+  blob: string;
+};
+
+export type ClientLogsResult = {
+  type: "client_logs_result";
+  commandId?: string;
+  ok: boolean;
+  entries?: ClientLogEntry[];
+  dropped?: number;
+  fromSeq?: number;
+  toSeq?: number;
+  enabled: boolean;
+  error?: string;
+};
+
+export type ScreenshotResult = {
+  type: "screenshot_result";
+  commandId?: string;
+  format: "jpeg" | "webp" | "png" | string;
+  width?: number;
+  height?: number;
+  data: Uint8Array;
+  error?: string;
+};
+
+export type FrameHeader = {
+  monitor: number;
+  fps: number;
+  format: "jpeg" | "webp" | "raw" | "h264" | "hevc";
+  width?: number;
+  height?: number;
+  hash?: string;
+  backstage?: boolean;
+  webcam?: boolean;
+};
+
+export type Frame = { type: "frame"; header: FrameHeader; data: Uint8Array };
+export type FrameAck = { type: "frame_ack" };
+export type DesktopCursor = {
+  type: "desktop_cursor";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  visible: boolean;
+  cursorWidth?: number;
+  cursorHeight?: number;
+  hotspotX?: number;
+  hotspotY?: number;
+  image?: Uint8Array;
+};
+
+export type DesktopStreamStats = {
+  type: "desktop_stream_stats";
+  fps: number;
+  format: string;
+  bytes: number;
+  width: number;
+  height: number;
+  captureMs: number;
+  encodeMs: number;
+  sendMs: number;
+  totalMs: number;
+  transport: "websocket" | "webrtc" | string;
+};
+export type Status = {
+  type: "status";
+  state: "idle" | "streaming" | "error";
+  detail?: string;
+};
+
+export type WebcamDevice = {
+  index: number;
+  name: string;
+  maxFps?: number;
+};
+
+export type WebcamDevices = {
+  type: "webcam_devices";
+  devices: WebcamDevice[];
+  selected: number;
+};
+export type ConsoleOutput = {
+  type: "console_output";
+  sessionId: string;
+  data?: Uint8Array;
+  exitCode?: number;
+  error?: string;
+};
+
+export type FileEntry = {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number;
+  modTime: number;
+  mode?: string;
+  owner?: string;
+  group?: string;
+  attrs?: number;
+};
+
+export type FileIconResultItem = {
+  key: string;
+  png?: Uint8Array;
+  error?: string;
+};
+
+export type FileIconResult = {
+  type: "file_icon_result";
+  commandId?: string;
+  icons: FileIconResultItem[];
+};
+
+export type FileThumbnailResultItem = {
+  key: string;
+  jpeg?: Uint8Array;
+  w?: number;
+  h?: number;
+  error?: string;
+};
+
+export type FileThumbnailResult = {
+  type: "file_thumb_result";
+  commandId?: string;
+  thumbs: FileThumbnailResultItem[];
+};
+
+export type FolderSizeResult = {
+  type: "file_dirsize_result";
+  commandId?: string;
+  path: string;
+  bytes: number;
+  files: number;
+  dirs: number;
+  done: boolean;
+  error?: string;
+};
+
+export type FileListResult = {
+  type: "file_list_result";
+  commandId?: string;
+  path: string;
+  entries: FileEntry[];
+  error?: string;
+  accessDenied?: boolean;
+  canRequestAccess?: boolean;
+  accessHelp?: string;
+};
+
+export type FileDownload = {
+  type: "file_download";
+  commandId?: string;
+  path: string;
+  data: Uint8Array;
+  offset: number;
+  total: number;
+  chunkIndex?: number;
+  chunksTotal?: number;
+  error?: string;
+};
+
+export type FileUploadResult = {
+  type: "file_upload_result";
+  commandId?: string;
+  transferId?: string;
+  path: string;
+  ok: boolean;
+  offset?: number;
+  size?: number;
+  received?: number;
+  total?: number;
+  error?: string;
+};
+
+export type ProcessInfo = {
+  pid: number;
+  ppid: number;
+  name: string;
+  exePath?: string;
+  cpu: number;
+  memory: number;
+  username?: string;
+  type?: string;
+  self?: boolean;
+};
+
+export type ProcessListResult = {
+  type: "process_list_result";
+  commandId?: string;
+  processes: ProcessInfo[];
+  error?: string;
+};
+
+export type FileReadResult = {
+  type: "file_read_result";
+  commandId?: string;
+  path: string;
+  content: string;
+  isBinary: boolean;
+  error?: string;
+};
+
+export type FileSearchResult = {
+  type: "file_search_result";
+  commandId?: string;
+  searchId: string;
+  results: Array<{
+    path: string;
+    line?: number;
+    match?: string;
+  }>;
+  complete: boolean;
+  error?: string;
+};
+
+export type ScriptResult = {
+  type: "script_result";
+  commandId?: string;
+  ok: boolean;
+  output?: string;
+  error?: string;
+};
+
+export type PluginManifest = {
+  id: string;
+  name: string;
+  apiVersion?: number;
+  runtime?: "native" | "server" | string;
+  nativeLoader?: "memory" | "os" | string;
+  autoLoadByDefault?: boolean;
+  nativeEntrypoints?: PluginNativeEntrypoints;
+  version?: string;
+  description?: string;
+  binary?: string;
+  binaries?: Record<string, string>;
+  needs?: PluginNeeds;
+  entry?: string;
+  assets?: {
+    html?: string;
+    css?: string;
+    js?: string;
+  };
+  navbar?: {
+    label?: string;
+    icon?: string;
+  };
+  dashboard?: PluginDashboardIntegration;
+  build?: PluginBuildIntegration;
+  hasServer?: boolean;
+};
+
+export type PluginNativeEntrypoints = {
+  onLoad?: string;
+  onEvent?: string;
+  onUnload?: string;
+  setCallback?: string;
+  getRuntime?: string;
+};
+
+export type PluginDashboardIntegration = {
+  clientBadges?: PluginDashboardBadgeDefinition[];
+};
+
+export type PluginDashboardBadgeDefinition = {
+  id: string;
+  label?: string;
+  title?: string;
+  icon?: string;
+  imageUrl?: string;
+  href?: string;
+  tone?: "info" | "good" | "warn" | "danger" | string;
+  priority?: number;
+};
+
+export type PluginBuildIntegration = {
+  enabledByDefault?: boolean;
+  label?: string;
+  description?: string;
+  provider?: PluginBuildProvider;
+  settings?: PluginBuildSetting[];
+  actions?: PluginBuildAction[];
+  requires?: PluginBuildRequirement[];
+};
+
+export type PluginBuildProvider = {
+  label?: string;
+  description?: string;
+  icon?: string;
+  platforms: string[];
+};
+
+export type PluginBuildSetting = {
+  key: string;
+  label?: string;
+  type?: "string" | "number" | "boolean" | "select" | "textarea" | string;
+  default?: unknown;
+  placeholder?: string;
+  description?: string;
+  required?: boolean;
+  min?: number;
+  max?: number;
+  options?: Array<{ value: string; label?: string } | string>;
+};
+
+export type PluginBuildAction = {
+  id: string;
+  label: string;
+  icon?: string;
+  description?: string;
+  setBuild?: Record<string, unknown>;
+  setSettings?: Record<string, unknown>;
+  requires?: PluginBuildRequirement[];
+};
+
+export type PluginBuildRequirement = {
+  field?: string;
+  pluginSetting?: string;
+  equals?: unknown;
+  notEquals?: unknown;
+  truthy?: boolean;
+  falsy?: boolean;
+  includes?: unknown;
+  platforms?: string[];
+  message?: string;
+};
+
+export type PluginFileNeed = {
+  bucket: "home" | "desktop" | "documents" | "downloads" | "temp" | "appData" | "pluginData" | "fullDisk" | string;
+  access: Array<"read" | "write" | "list" | "delete" | "mkdir" | string>;
+  reason?: string;
+};
+
+export type PluginNeeds = {
+  files?: PluginFileNeed[];
+};
+
+export type PluginSignatureInfo = {
+  signed: boolean;
+  trusted: boolean;
+  valid: boolean;
+  fingerprint?: string;
+  algorithm?: string;
+};
+
+export type PluginEvent = {
+  type: "plugin_event";
+  pluginId: string;
+  event: string;
+  payload?: unknown;
+  error?: string;
+};
+
+export type NotificationEvent = {
+  type: "notification";
+  category: "active_window";
+  title: string;
+  process?: string;
+  processPath?: string;
+  pid?: number;
+  keyword?: string;
+  ts?: number;
+};
+
+export type NotificationConfig = {
+  type: "notification_config";
+  keywords: string[];
+  minIntervalMs?: number;
+  clipboardEnabled?: boolean;
+};
+
+export type WireMessage =
+  | Hello
+  | HelloAck
+  | Ping
+  | Pong
+  | Command
+  | CommandResult
+  | ClientLogsResult
+  | ScreenshotResult
+  | Frame
+  | FrameAck
+  | DesktopStreamStats
+  | DesktopCursor
+  | Status
+  | ConsoleOutput
+  | FileListResult
+  | FileDownload
+  | FileUploadResult
+  | ProcessListResult
+  | FileReadResult
+  | FileSearchResult
+  | ScriptResult
+  | PluginEvent
+  | NotificationEvent
+  | NotificationConfig
+  | EnrollmentChallenge
+  | EnrollmentStatusMsg;
+
+export function encodeMessage(msg: WireMessage): Uint8Array {
+  if (msg.type === "command") {
+    if (!isCommandType(msg.commandType)) {
+      throw new Error(`Unknown command type: ${String(msg.commandType)}`);
+    }
+    const commandVersion =
+      msg.commandVersion ?? getImplicitCommandVersion(msg.commandType);
+    return encode({ ...msg, commandVersion });
+  }
+  return encode(msg);
+}
+
+export function decodeMessage(
+  input: Uint8Array | ArrayBuffer | string,
+): WireMessage {
+  if (typeof input === "string") {
+    return JSON.parse(input) as WireMessage;
+  }
+  preflightMessagePack(input);
+  return decode(input) as WireMessage;
+}

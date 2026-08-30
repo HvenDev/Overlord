@@ -1,0 +1,826 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/doesntbreaktos/Overlord/main/Overlord-Server/public/assets/overlord.png" alt="Overlord" width="280" />
+</p>
+
+# Overlord
+
+# [TELEGRAM SERVER JOIN NOW NO EXCUSES WE GIVE SUPPORT AND IT'S FUN](https://t.me/Onimai)
+
+Hello, I made this project for fun.
+
+The canonical repository is [GitHub](https://github.com/doesntbreaktos/Overlord); [GitLab](https://gitlab.com/vxaboveground/overlord) is maintained only as a source mirror.
+
+The server is TypeScript on Node/Bun. The client is Go. Operators talk to the server through a web panel or the Electron desktop app, and agents connect over encrypted WebSockets.
+
+On Linux, Docker is the easiest way to run it. On Windows, a native
+bare-metal installation is strongly recommended instead of Docker Desktop.
+
+> [!IMPORTANT]
+> Use Overlord only on systems you own or are explicitly authorized to
+> administer. Review the [Acceptable Use Policy](ACCEPTABLE_USE.md) before
+> deployment. Report vulnerabilities privately according to the
+> [Security Policy](SECURITY.md).
+
+---
+
+- [Platform Recommendation](#platform-recommendation)
+- [Docker Quick Start (Recommended on Linux)](#docker-quick-start-recommended-on-linux)
+  - [Windows (not recommended)](#windows-not-recommended)
+  - [Linux](#linux)
+  - [macOS](#macos)
+- [Native Bare-Metal Installation](#native-bare-metal-installation)
+- [Rust Lite Agent](#rust-lite-agent)
+- [Production Package Scripts](#production-package-scripts)
+- [WebRTC Streaming](#webrtc-streaming)
+- [OIDC / SSO Login](#oidc--sso-login)
+- [Login Branding](#login-branding)
+- [Docker Notes (TLS, reverse proxy, cache)](#docker-notes-tls-reverse-proxy-cache)
+
+---
+
+## Platform Recommendation
+
+> [!WARNING]
+> **Do not use Docker Desktop for a normal Windows deployment.** Linux
+> containers on Windows run through a WSL2/Hyper-V virtual machine. This is
+> substantially slower than running Overlord directly on Windows or on a
+> Linux host, and the extra virtualization/networking layer provides fewer
+> host-integration features.
+
+For the best experience, choose one of these:
+
+1. **Linux host:** run the provided Docker Compose deployment (recommended),
+   or use the native Linux scripts.
+2. **Windows host:** run Overlord directly on Windows using the
+   [native/bare-metal scripts](#native-bare-metal-installation).
+
+The Windows Docker Compose file remains available for compatibility and
+testing, but it is not the recommended Windows installation method.
+
+---
+
+## Docker Quick Start (Recommended on Linux)
+
+Docker is recommended on a Linux host. The macOS and Windows instructions are
+provided for compatibility and local testing; Windows users should prefer a
+native installation or move the server to Linux.
+
+> Windows and macOS use `docker-compose.windows.yml`. Linux uses the default `docker-compose.yml` (host networking).
+
+After the first start, open `https://localhost:5173`. The default username is
+`admin`. Unless you set `OVERLORD_PASS`, first startup generates a one-time
+password in `data/save.json` (inside the container: `/app/data/save.json`). For
+Docker Compose, retrieve it with:
+
+```text
+docker compose exec overlord-server grep bootstrapPassword /app/data/save.json
+```
+
+The first login requires a password change, after which the plaintext bootstrap
+password is removed from `save.json`. Existing installations are not reset; if
+an older installation still uses `admin` / `admin`, change it manually. Keep
+`save.json` private and back it up.
+
+Agents authenticate only through the `X-Agent-Token` header. Rebuild any
+legacy agent that still places its token in the connection URL; query-string
+agent credentials are rejected.
+
+---
+
+### Windows (not recommended)
+
+> [!CAUTION]
+> Docker Desktop on Windows is virtualized, noticeably slower, and exposes
+> fewer Overlord features than a native Windows or Linux installation. Prefer
+> [Windows bare metal](#windows-recommended), or deploy the server on Linux
+> using the [Linux Docker instructions](#linux).
+
+<details>
+<summary>Compatibility/testing only: Windows Docker Desktop</summary>
+<br>
+
+**1. Install Docker Desktop**
+
+Either from the website:
+
+- https://docs.docker.com/desktop/setup/install/windows-install/
+
+Or with winget:
+
+```powershell
+winget install -e --id Docker.DockerDesktop
+```
+
+Start Docker Desktop once, then verify:
+
+```powershell
+docker --version
+docker compose version
+```
+
+**2. Get the project**
+
+```powershell
+git clone https://github.com/doesntbreaktos/Overlord.git
+cd Overlord
+```
+
+**3. Start it**
+
+```powershell
+docker compose -f docker-compose.windows.yml up -d
+```
+
+**4. Get the initial password**
+
+The default username is `admin`. Retrieve the generated one-time password with:
+
+```powershell
+docker compose -f docker-compose.windows.yml exec overlord-server grep bootstrapPassword /app/data/save.json
+```
+
+Use the value shown after `bootstrapPassword`. It is removed from `save.json`
+after you sign in and change it.
+
+**5. Open the panel**
+
+```text
+https://localhost:5173
+```
+
+**6. Update later**
+
+```powershell
+docker compose -f docker-compose.windows.yml down
+docker compose -f docker-compose.windows.yml pull
+docker compose -f docker-compose.windows.yml up -d
+```
+
+**7. Stop**
+
+```powershell
+docker compose -f docker-compose.windows.yml down
+```
+
+</details>
+
+---
+
+### Linux
+
+<details>
+<summary>Step-by-step: Linux (Debian / Ubuntu / Kali)</summary>
+<br>
+
+**1. Install Docker**
+
+Official docs: https://docs.docker.com/engine/install/debian/
+
+Set up Docker's apt repository:
+
+```bash
+# Add Docker's official GPG key:
+sudo apt update
+sudo apt install ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+# Add the repository to Apt sources:
+sudo tee /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: $(. /etc/os-release && echo "$VERSION_CODENAME")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+sudo apt update
+```
+
+On a derivative distro (e.g. Kali), replace the codename expansion with the matching Debian codename, e.g. `bookworm`.
+
+Install Docker:
+
+```bash
+sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+Make sure the daemon is running:
+
+```bash
+sudo systemctl status docker
+```
+
+**2. Grab the compose file**
+
+Make a folder for it, drop in the file, and you're done:
+
+```bash
+mkdir overlord && cd overlord
+wget https://raw.githubusercontent.com/doesntbreaktos/Overlord/main/docker-compose.yml
+```
+
+No `wget`? Use `curl`:
+
+```bash
+mkdir overlord && cd overlord
+curl -O https://raw.githubusercontent.com/doesntbreaktos/Overlord/main/docker-compose.yml
+```
+
+**3. Start it**
+
+```bash
+docker compose up -d
+```
+
+The Compose file itself is downloaded from the canonical GitHub repository,
+and the default image is pulled from GitHub Container Registry at
+`ghcr.io/doesntbreaktos/overlord:latest`.
+
+Maintainers can publish a matching multi-architecture GHCR image from the
+[overlord-ci workflow](https://github.com/doesntbreaktos/Overlord/actions/workflows/docker-publish.yml).
+Select **Run workflow** and enter the version currently declared by the server
+and agent (for example, `3.1.0`). The workflow publishes version, major/minor,
+major, and `latest` tags to `ghcr.io/doesntbreaktos/overlord`. Keep the package
+visibility public so Compose can pull it without GitHub authentication.
+
+**4. Get the initial password**
+
+The default username is `admin`. Retrieve the generated one-time password with:
+
+```bash
+docker compose exec overlord-server grep bootstrapPassword /app/data/save.json
+```
+
+Use the value shown after `bootstrapPassword`. It is removed from `save.json`
+after you sign in and change it.
+
+**5. Open the panel**
+
+```text
+https://localhost:5173
+
+or 
+
+https://IP:5173
+```
+
+**6. Update later**
+
+From the same folder:
+
+```bash
+docker compose down
+docker compose pull
+docker compose up -d
+```
+
+**7. Stop**
+
+```bash
+docker compose down
+```
+
+</details>
+
+---
+
+### macOS
+
+<details>
+<summary>Step-by-step: macOS</summary>
+<br>
+
+**1. Install Docker Desktop**
+
+Either from the website:
+
+- https://docs.docker.com/desktop/setup/install/mac-install/
+
+Or with Homebrew:
+
+```bash
+brew install --cask docker
+```
+
+Start Docker Desktop once, then verify:
+
+```bash
+docker --version
+docker compose version
+```
+
+**2. Get the project**
+
+```bash
+git clone https://github.com/doesntbreaktos/Overlord.git
+cd Overlord
+```
+
+**3. Start it**
+
+macOS uses the same compose file as Windows:
+
+```bash
+docker compose -f docker-compose.windows.yml up -d
+```
+
+**4. Get the initial password**
+
+The default username is `admin`. Retrieve the generated one-time password with:
+
+```bash
+docker compose -f docker-compose.windows.yml exec overlord-server grep bootstrapPassword /app/data/save.json
+```
+
+Use the value shown after `bootstrapPassword`. It is removed from `save.json`
+after you sign in and change it.
+
+**5. Open the panel**
+
+```text
+https://localhost:5173
+```
+
+**6. Update later**
+
+```bash
+docker compose -f docker-compose.windows.yml down
+docker compose -f docker-compose.windows.yml pull
+docker compose -f docker-compose.windows.yml up -d
+```
+
+**7. Stop**
+
+```bash
+docker compose -f docker-compose.windows.yml down
+```
+
+</details>
+
+---
+
+## Native Bare-Metal Installation
+
+Use the included scripts to run without Docker. This is the recommended
+installation method on Windows.
+
+Prerequisites:
+
+- Bun in PATH
+- Go 1.21+ in PATH
+
+### Windows (recommended)
+
+> [!TIP]
+> This native Windows path avoids Docker Desktop's Linux VM and provides the
+> best Windows performance and feature availability.
+
+Development mode (starts server + client):
+
+```bat
+scripts\start-dev.bat
+```
+
+Production mode (build + run server executable):
+
+```bat
+scripts\start-prod.bat
+```
+
+After the server starts for the first time, open another PowerShell window and
+retrieve the generated password with:
+
+```powershell
+(Get-Content "$env:APPDATA\Overlord\save.json" | ConvertFrom-Json).auth.bootstrapPassword
+```
+
+Sign in as `admin`. The first login requires a password change, after which the
+bootstrap password is removed from the file.
+
+Build client binaries (adds client builds to the build queue):
+
+```bat
+scripts\build-clients.bat
+```
+
+### Linux / macOS
+
+Make scripts executable once:
+
+```bash
+chmod +x scripts/*.sh scripts/*.command
+```
+
+Development mode (server in background, client in foreground):
+
+```bash
+./scripts/start-dev.sh
+```
+
+Only server, or only client:
+
+```bash
+./scripts/start-dev.sh server
+./scripts/start-dev.sh client
+```
+
+Production mode:
+
+```bash
+./scripts/start-prod.sh
+```
+
+After the server starts for the first time, open another terminal in the
+repository root and retrieve the generated password with:
+
+```bash
+grep bootstrapPassword Overlord-Server/data/save.json
+```
+
+Sign in as `admin` using the displayed value. The first login requires a
+password change, after which the bootstrap password is removed from the file.
+
+---
+
+## Rust Lite Agent
+
+`Overlord-Lite` is an experimental Rust client focused on authenticated
+connections, TLS identity pinning, and heartbeat/reconnect behavior. It
+supports interactive TTY console sessions while omitting plugins plus the full
+Go agent's desktop, webcam, audio, persistence, and OS-integration features.
+See [Overlord-Lite/README.md](Overlord-Lite/README.md) for build instructions,
+configuration, and Build-page integration.
+
+## Production Package Scripts
+
+Build a production-ready package where the server can still build client binaries at runtime.
+
+Windows:
+
+```bat
+scripts\build-prod-package.bat
+```
+
+Output: `release/`
+
+Linux / macOS:
+
+```bash
+./scripts/build-prod-package.sh
+```
+
+Output: `release/prod-package/`
+
+Docker images and both package scripts fingerprint first-party JavaScript and
+CSS filenames with a deterministic build digest, then rewrite HTML and module
+imports to match. Development keeps readable stable paths. This provides safe
+immutable caching and removes version-stable asset URLs, but it is defense in
+depth rather than a substitute for putting the panel behind a VPN, firewall,
+or authenticated reverse proxy.
+
+---
+
+## WebRTC Streaming
+
+The remote desktop viewer has a **Transport** dropdown with three modes:
+
+- **Canvas** (default): H.264 / JPEG / block frames over the existing WebSocket, decoded into a `<canvas>`. Highest latency, works anywhere the WS does.
+- **WebRTC P2P**: browser ↔ agent direct when possible, with the bundled Coturn server as a fallback for restrictive or symmetric NAT. MediaMTX is not involved. Lowest latency on a direct route.
+- **WebRTC Relayed**: agent publishes to a MediaMTX sidecar via WHIP, browser plays via WHEP. The server proxies signaling so the existing JWT auth + per-client RBAC still apply. Lowest-effort fallback when P2P can't punch through.
+
+### Building agents with WebRTC
+
+WebRTC is **opt-in per agent build**. In the builder UI, tick the **WebRTC** checkbox before clicking Build. Without it, the Pion stack (~6 MB of Go modules) is not compiled in — any WebRTC start attempt from the operator returns `webrtc support not compiled in` and the viewer falls back to Canvas. The Canvas path always works regardless of the build setting.
+
+The build tag (`overlord_webrtc`) is also available if you build agents outside the UI:
+
+```bash
+go build -tags overlord_webrtc ./cmd/agent
+```
+
+### Coturn STUN / TURN
+
+Compose starts `overlord-coturn` for ICE traversal in both P2P and MediaMTX Relayed modes. A one-time init service generates a random master secret and a neutral random TURN realm in the private `overlord-turn-secret` Docker volume. Overlord uses that secret to issue one-hour Coturn REST credentials independently to the authenticated P2P viewer and agent. MediaMTX reads the secret inside Docker and also generates expiring credentials for its WHIP/WHEP clients. No Google STUN server is used, and the master secret is never sent directly to a peer. Set `OVERLORD_TURN_REALM` only when you need an explicit realm; avoid product-identifying values because TURN authentication challenges disclose it.
+
+The defaults work for same-machine testing. For LAN or internet access, set the address that both the browser and agent can reach in a `.env` file next to the compose file:
+
+```env
+OVERLORD_TURN_HOST=turn.example.com
+OVERLORD_TURN_EXTERNAL_IP=203.0.113.10
+```
+
+`OVERLORD_TURN_HOST` is placed in the ICE URLs and may be a public DNS name or IP. `OVERLORD_TURN_EXTERNAL_IP` tells Coturn which public address to advertise when the Docker host is behind NAT; omit it when Coturn binds the public interface directly. Do not use the Docker service name because peers outside the Compose network cannot resolve or reach it.
+
+Allow and forward these inbound ports to the Coturn host:
+
+- `3478/udp` and `3478/tcp` for STUN and TURN client connections.
+- `49160-49200/udp` for TURN relay allocations with the Linux Compose file.
+- `40000-40040/udp` with `docker-compose.windows.yml`, avoiding Windows'
+  commonly excluded dynamic UDP range. Override it with
+  `OVERLORD_TURN_MIN_PORT` and `OVERLORD_TURN_MAX_PORT` if necessary.
+
+The bundled setup supports ordinary TURN over UDP and TCP. It intentionally does not enable `turns:` until a trusted Coturn TLS certificate and public hostname are configured.
+
+### MediaMTX sidecar
+
+Compose starts an `overlord-mediamtx` service for Relayed mode. It needs:
+
+- Port `8189/udp` and `8189/tcp` reachable from operators (WebRTC ICE traffic). The Windows / macOS compose publishes these; Linux uses host networking and shares the host's interfaces directly.
+- No auth config — the Overlord server proxies every WHIP/WHEP request through `/api/webrtc/...` and enforces the existing operator JWT + RBAC there.
+
+On Linux host networking, MediaMTX's HTTP signaling listener is explicitly
+bound to `127.0.0.1:8889`; only the authenticated Overlord proxy can reach it.
+The ICE listeners remain externally reachable as required for media transport.
+
+If you only ever want P2P, you can comment out the `mediamtx:` service in your compose file — only Relayed mode depends on it. MediaMTX is configured to use the same Coturn service as a client-only ICE fallback, but it is not itself a STUN/TURN server; Coturn handles all relay allocations.
+
+### LAN / public access
+
+MediaMTX automatically discovers addresses assigned directly to its network interfaces. This covers ordinary Linux host-network and many LAN deployments, but it cannot reliably infer a public address created by NAT, port forwarding, a cloud load balancer, or a reverse proxy. It also cannot discover which public DNS name you intend operators to use.
+
+Before using **WebRTC Relayed** from another machine, make sure MediaMTX advertises an address that both agents and operators can reach:
+
+- **Linux with host networking and no public NAT:** normally nothing is required; MediaMTX sees the host's interfaces automatically.
+- **Public server behind NAT, port forwarding, or a cloud public-IP mapping:** set the public IP or a DNS name that resolves to it.
+- **Windows / macOS Docker Desktop:** set the host's reachable LAN/public address because automatic interface discovery sees the container network, not necessarily the Docker host.
+- **Same-machine testing on Docker Desktop:** retain `127.0.0.1` in the list.
+
+Set `OVERLORD_WEBRTC_ADDITIONAL_HOSTS` as a comma-separated list in the shell or in a `.env` file next to the compose file:
+
+```env
+# LAN example
+OVERLORD_WEBRTC_ADDITIONAL_HOSTS=192.168.1.42
+
+# Public DNS plus LAN access
+OVERLORD_WEBRTC_ADDITIONAL_HOSTS=stream.example.com,192.168.1.42
+
+# Docker Desktop: same host plus other LAN machines
+OVERLORD_WEBRTC_ADDITIONAL_HOSTS=127.0.0.1,192.168.1.42
+```
+
+Ensure inbound UDP `8189` is forwarded to the MediaMTX host/container; TCP `8189` is the slower fallback. Recreate the sidecar after changing the setting:
+
+```bash
+# Linux
+docker compose up -d --force-recreate mediamtx
+
+# Windows / macOS Docker Desktop
+docker compose -f docker-compose.windows.yml up -d --force-recreate mediamtx
+```
+
+To verify the selected route, open `chrome://webrtc-internals` during a relayed stream and confirm that the chosen remote candidate points to the expected server address and preferably uses UDP.
+
+Automatic public-IP discovery is possible with STUN, but it is not a complete replacement for this setting: it can require random UDP ports, does not discover your intended domain, and can fail behind restrictive or symmetric NAT. For predictable production deployments, explicitly setting the reachable IP/domain and forwarding fixed UDP port `8189` is recommended.
+
+### Remote desktop network impairment tests
+
+On a Linux test host, `scripts/rd-network-impairment.sh` applies repeatable bandwidth, latency, jitter, and packet-loss profiles with `tc netem`. Give it the exact interface carrying the WebRTC traffic:
+
+```bash
+# Inspect interfaces first; do not guess the target.
+ip link show
+
+sudo bash scripts/rd-network-impairment.sh apply eth0 wan
+bash scripts/rd-network-impairment.sh status eth0
+
+# Always restore the interface after the test.
+sudo bash scripts/rd-network-impairment.sh clear eth0
+```
+
+Available profiles are `wan` (20 Mbps), `constrained` (8 Mbps), and `harsh` (3 Mbps), with progressively higher delay, jitter, and loss. The rule affects all egress traffic on the selected interface, not only Overlord. The script refuses to touch loopback unless `OVERLORD_NETEM_ALLOW_LOOPBACK=1` is explicitly set.
+
+For each profile, start Remote Desktop with both **Profile: Auto (best)** and **Bitrate: Auto**, then watch the Stats HUD. Verify that bitrate falls before the profile steps down, decode/processing queues remain bounded, and the profile slowly recovers after clearing the impairment.
+
+### Advanced MediaMTX customization
+
+The compose file passes a minimal set of `MTX_*` environment variables to MediaMTX — enough for Overlord to work. To change anything else (codecs, paths, ICE servers, etc.), either:
+
+- Add more `MTX_*` variables to the `mediamtx` service's `environment:` block (every option in MediaMTX's docs is supported as an env var), or
+- Provide a full `mediamtx.yml` via a bind mount:
+
+  ```yaml
+  mediamtx:
+    # ...existing config...
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+  ```
+
+  Make sure the file exists on the host *before* the container starts — Docker will otherwise auto-create an empty directory at that path and fail with "not a directory".
+
+---
+
+## OIDC / SSO Login
+
+Overlord supports generic OIDC login for homelab identity providers such as Authentik, Authelia, Keycloak, Zitadel, and Dex. Local username/password login stays enabled as a fallback.
+
+Configure your OIDC provider with this redirect URI:
+
+```text
+https://YOUR_OVERLORD_HOST/api/oidc/callback
+```
+
+Then set the relevant environment variables:
+
+```env
+OVERLORD_OIDC_ENABLED=true
+OVERLORD_OIDC_LABEL=Sign in with SSO
+OVERLORD_OIDC_ISSUER=https://auth.example.com/application/o/overlord/
+OVERLORD_OIDC_CLIENT_ID=overlord
+OVERLORD_OIDC_CLIENT_SECRET=change-me
+OVERLORD_OIDC_REDIRECT_URI=https://overlord.example.com/api/oidc/callback
+OVERLORD_OIDC_DEFAULT_ROLE=viewer
+OVERLORD_OIDC_ALLOWED_DOMAINS=example.com
+OVERLORD_OIDC_ADMIN_GROUPS=overlord-admins
+OVERLORD_OIDC_OPERATOR_GROUPS=overlord-operators
+OVERLORD_OIDC_VIEWER_GROUPS=overlord-viewers
+```
+
+New OIDC users are linked by the provider's `issuer + sub` identity. Email/username linking to an existing local account is disabled by default; enable `OVERLORD_OIDC_ALLOW_EMAIL_LINK=true` only if you trust your provider's verified email claims.
+
+---
+
+## Login Branding
+
+Self-hosted and enterprise deployments can brand the login screen with environment variables:
+
+```env
+OVERLORD_LOGIN_BRAND_NAME=Acme SOC
+OVERLORD_NAV_BRAND_NAME=Acme Console
+OVERLORD_BRAND_ACCENT_COLOR=#14b8a6
+OVERLORD_LOGIN_TITLE=Welcome to Acme Overlord
+OVERLORD_LOGIN_SUBTITLE=Sign in with your Acme identity
+OVERLORD_LOGIN_LOGO_URL=/assets/acme-logo.png
+OVERLORD_LOGIN_LOGO_ALT=Acme logo
+OVERLORD_NAV_LOGO_URL=/assets/acme-nav-logo.png
+OVERLORD_NAV_LOGO_ALT=Acme logo
+OVERLORD_LOGIN_HERO_IMAGE_URL=/assets/acme-login.jpg
+OVERLORD_LOGIN_HERO_IMAGE_ALT=Acme operations center
+OVERLORD_LOGIN_FOOTER_TEXT=Authorized Acme access only
+OVERLORD_LOGIN_SUPPORT_TEXT=Need access help?
+OVERLORD_LOGIN_SUPPORT_URL=https://help.example.com
+OVERLORD_LOGIN_ICON_CLASS=fa-solid fa-shield-halved
+```
+
+Logo, hero, and support URLs accept absolute `http(s)` URLs or root-relative paths. If no logo URL is set, the UI uses `OVERLORD_LOGIN_ICON_CLASS`. The same options can also be managed from Settings → Branding.
+
+---
+
+## Docker Notes (TLS, reverse proxy, cache)
+
+Notes on configs and workarounds.
+
+### BuildKit cache for faster rebuilds
+
+`docker-compose.yml` ships with `build.cache_from` and `build.cache_to` pointing at `.docker-cache/buildx`. Local builds reuse it automatically — no extra setup.
+
+### Runtime client build cache
+
+The compose setup uses a persistent volume for runtime client builds:
+
+- Volume: `overlord-client-build-cache`
+- Mount: `/app/client-build-cache`
+- Env: `OVERLORD_CLIENT_BUILD_CACHE_DIR` (default `/app/client-build-cache`)
+
+The server runs as UID/GID `1000:1000` with all Linux capabilities dropped and
+a read-only root filesystem. A one-shot Compose service repairs ownership on
+volumes created by older root-running releases. The mutable Go agent source is
+copied into an ephemeral `tmpfs` at startup, while finished builds and compiler
+caches remain in persistent volumes. MediaMTX runs as `65534:65534` with the
+same read-only and capability restrictions.
+
+### Self-signed certificate identity
+
+New self-signed certificates use independently randomized country, region,
+locality, organization, organizational unit, and common-name values. Endpoint
+validation still uses the configured hostname/IP SANs. On startup, the exact
+legacy `O=Overlord` self-signed profile is reissued with randomized metadata
+using its existing private key. This changes the certificate subject,
+thumbprint, and browser trust entry but preserves the SPKI pin embedded in
+agents. Reinstall the downloaded certificate in browsers/OS trust stores after
+the first upgraded restart. Set `OVERLORD_TLS_MIGRATE_LEGACY_CERT=false` only
+to postpone this migration.
+
+### macOS CGO builds on Linux/Docker
+
+When a macOS target is selected with CGO enabled, the builder asks for a user-provided macOS SDK archive. Package the complete `MacOSX*.sdk` directory as `.tar.xz`, `.tar.gz`, `.tgz`, or `.tar` and upload it from the Build page. The archive must contain the SDK's `System/Library/Frameworks` and `usr` directories.
+
+The upload is limited to 1 GB, belongs to the authenticated user, can be used for only one build, and is deleted after the build. Unused uploads expire after one hour. The Docker image supplies Clang and LLD; Apple SDK files are never bundled or downloaded by Overlord.
+
+### Certbot TLS
+
+To use Let's Encrypt certificates in production Docker:
+
+1. Set `OVERLORD_TLS_CERTBOT_ENABLED=true`
+2. Set `OVERLORD_TLS_CERTBOT_DOMAIN=your-domain.com`
+3. Mount letsencrypt into the container read-only, e.g. `/etc/letsencrypt:/etc/letsencrypt:ro`
+
+Default cert paths:
+
+```
+cert: /etc/letsencrypt/live/<domain>/fullchain.pem
+key:  /etc/letsencrypt/live/<domain>/privkey.pem
+ca:   /etc/letsencrypt/live/<domain>/chain.pem
+```
+
+Override with:
+
+- `OVERLORD_TLS_CERTBOT_LIVE_PATH`
+- `OVERLORD_TLS_CERTBOT_CERT_FILE`
+- `OVERLORD_TLS_CERTBOT_KEY_FILE`
+- `OVERLORD_TLS_CERTBOT_CA_FILE`
+
+### Reverse proxy TLS offload
+
+Overlord can serve HTTP only on loopback while nginx, Caddy, Traefik, IIS, or
+another trusted reverse proxy owns the public HTTPS certificate. Browsers and
+agents must still use the public `https://` / `wss://` address.
+
+HTTP/3 is enabled automatically when Overlord terminates TLS itself. QUIC uses
+UDP on the same port as HTTPS (5173 by default), so direct deployments must
+allow both TCP and UDP on that port. HTTP/1.1 remains enabled for initial
+`Alt-Svc` discovery, health checks, clients without HTTP/3, and WebSocket
+upgrades. When `OVERLORD_TLS_OFFLOAD=true`, the reverse proxy owns public
+HTTP/3 support because Bun's internal listener has no TLS.
+
+The unauthenticated `/health` endpoint accepts only loopback clients. To verify
+both advertisement and an actual QUIC transfer, run the check on the Overlord
+host with an HTTP/3-capable curl build:
+
+```powershell
+.\scripts\test-http3.ps1 https://127.0.0.1:5173/health -AllowUntrustedCertificate
+```
+
+For a self-signed certificate, add `-AllowUntrustedCertificate`.
+
+To compare cold HTTP/1.1 and HTTP/3 request timings:
+
+```powershell
+.\scripts\benchmark-http3.ps1 https://127.0.0.1:5173/health -Requests 30 -AllowUntrustedCertificate
+```
+
+The benchmark selects an HTTP/3-capable curl automatically, validates the
+protocol used by every sample, prints average/p50/p95 timing, and saves the raw
+measurements as CSV.
+
+For a native install or Linux Docker with host networking, add this to `.env`:
+
+```env
+HOST=127.0.0.1
+OVERLORD_TLS_OFFLOAD=true
+OVERLORD_HEALTHCHECK_URL=http://127.0.0.1:5173/health
+```
+
+For Docker Desktop (`docker-compose.windows.yml`), the container must listen on
+all of its own interfaces while Docker publishes the port on host loopback:
+
+```env
+HOST=0.0.0.0
+OVERLORD_PUBLISH_HOST=127.0.0.1
+OVERLORD_TLS_OFFLOAD=true
+OVERLORD_HEALTHCHECK_URL=http://127.0.0.1:5173/health
+```
+
+Restart Overlord after changing `.env`. The reverse proxy upstream is then
+`http://127.0.0.1:5173`. It must preserve `Host`, set
+`X-Forwarded-Proto: https` and `X-Forwarded-For`, support WebSocket upgrades,
+and use timeouts/body limits suitable for long sessions and file uploads.
+
+Ready-to-copy Caddy and nginx configurations are in `deploy/reverse-proxy/`.
+Those examples accept TLS 1.3 only. This is also the required deployment mode
+when strict TLS 1.3 rejection is needed: Bun's native `Bun.serve` TLS listener
+currently negotiates TLS 1.3 by preference but does not expose an effective
+per-server minimum-version setting.
+
+When enabled:
+
+- Overlord skips certificate generation and serves internal HTTP.
+- Authentication cookies remain `Secure` because public TLS terminates at the proxy.
+- Proxy source-IP headers are trusted for auditing, bans, and rate limiting.
+- The internal HTTP listener must never be exposed directly to the internet.
+
+### Source IP behind a domain / reverse proxy
+
+If the dashboard, audit log, or IP bans show all agents as `172.x.x.x` (or some other proxy/bridge IP), something between the agent and Bun is rewriting the source IP. Two independent flags govern this:
+
+- `OVERLORD_TLS_OFFLOAD` — TLS terminates at the proxy; Overlord runs plain HTTP internally.
+- `OVERLORD_TRUST_PROXY` — honor `X-Forwarded-For` / `X-Real-IP` / `CF-Connecting-IP` so dashboard/audit/IP-bans see the real client. Auto-enabled when `TLS_OFFLOAD=true`.
+
+Common shapes:
+
+| Setup | `TLS_OFFLOAD` | `TRUST_PROXY` |
+|---|---|---|
+| Domain, no proxy (Linux host networking; certbot inside Overlord; Cloudflare DNS-only) | `false` | `false` |
+| Domain, proxy does TLS (Render, nginx terminating TLS → http upstream) | `true` | auto (`true`) |
+| Domain, proxy in front but Overlord still does TLS (Cloudflare orange-cloud Full Strict; nginx with `proxy_pass https://`) | `false` | `true` |
+
+Only enable `OVERLORD_TRUST_PROXY` when a trusted reverse proxy is in front. If Overlord is directly exposed and you enable it, agents can spoof their source IP by sending their own `X-Forwarded-For` header, breaking IP bans and audit accuracy. The upstream proxy also has to be configured to inject the header (Cloudflare does by default; nginx/Caddy/Traefik need explicit directives).
+
+If you're using `docker-compose.windows.yml` or `docker-compose.quickstart.yml` (Docker Desktop bridge networking) with **no** reverse proxy, Docker itself rewrites source IPs to the bridge gateway and there is no header to recover from — `TRUST_PROXY` cannot help. Either switch to Linux host networking or put a real reverse proxy in front.
+
+### Notes
+
+- Keep `HOST=0.0.0.0` inside the container. Limit exposure with `OVERLORD_PUBLISH_HOST`, not the bind host.
+- If your `.env` secret/password contains `$`, escape it as `$$` to avoid Docker Compose variable-expansion warnings.
