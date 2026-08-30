@@ -720,11 +720,7 @@ export async function startBuildProcess(
 
     const serverConfig = getConfig();
     const buildAgentToken = (serverConfig.auth.agentToken || "").trim();
-    const buildTlsSpkiPins: string[] = [];
-    if (
-      String(process.env.OVERLORD_TLS_OFFLOAD || "").toLowerCase() === "true" &&
-      buildTlsSpkiPins.length === 0
-    ) {
+	const buildTlsSpkiPins: string[] = [];
       throw new Error(
         "TLS offload requires OVERLORD_TLS_SPKI_PINS before building agents; " +
         "pin the external HTTPS/WSS certificate public key",
