@@ -13,8 +13,8 @@
 FROM oven/bun:1.4.0 AS builder
 WORKDIR /app
 
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+RUN --mount=type=cache,id=apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=apt-lib-cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         gcc-mingw-w64-x86-64 \
@@ -29,6 +29,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 ENV GO_VERSION=1.26.2
 ARG TARGETARCH
+
 RUN case "${TARGETARCH:-amd64}" in \
         amd64) GO_ARCH=amd64 ;; \
         arm64) GO_ARCH=arm64 ;; \
@@ -44,8 +45,8 @@ ENV GOPATH="/go"
 ENV GOCACHE=/root/.cache/go-build
 ENV GOMODCACHE=/go/pkg/mod
 
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg/mod \
+RUN --mount=type=cache,id=go-build-cache,target=/root/.cache/go-build \
+    --mount=type=cache,id=go-mod-cache,target=/go/pkg/mod \
     go install mvdan.cc/garble@latest
 
 # Rust toolchain for the BackstageInjection DLL cross-build (windows-gnu target).
@@ -53,10 +54,12 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     RUST_VERSION=1.85.0
+
 RUN wget -q "https://sh.rustup.rs" -O rustup-init.sh \
     && sh rustup-init.sh -y --default-toolchain "$RUST_VERSION" \
        --profile minimal --target x86_64-pc-windows-gnu \
     && rm -f rustup-init.sh
+
 ENV PATH="/usr/local/cargo/bin:${PATH}"
 
 # Pre-fetch the latest Donut shellcode converter binary.
@@ -72,10 +75,7 @@ RUN DONUT_TAG=$(curl -sSf "https://api.github.com/repos/TheWover/donut/releases/
         echo "WARNING: Donut pre-fetch failed — will fall back to system PATH or download on first use"; \
     fi
 
-# Pre-fetch the latest Rust SGN (Shikata Ga Nai) binary. The Rust releases use
-# target-triple tarballs instead of the legacy sgn_linux_amd64_*.zip naming.
-# The runtime sgn-manager re-checks GitHub daily; this provides an offline
-# binary for supported Docker architectures on first start.
+# Pre-fetch the latest Rust SGN (Shikata Ga Nai) binary.
 RUN SGN_ASSET=$(curl -sSf "https://api.github.com/repos/EgeBalci/sgn/releases/latest" \
         | grep -oE '"browser_download_url":[[:space:]]*"[^"]*sgn-x86_64-unknown-linux-musl\.tar\.gz"' \
         | head -1 | cut -d'"' -f4) \
@@ -92,31 +92,27 @@ RUN SGN_ASSET=$(curl -sSf "https://api.github.com/repos/EgeBalci/sgn/releases/la
 
 # Full bun install (includes devDeps needed for tailwind / vendor / minify steps)
 COPY Overlord-Server/package.json Overlord-Server/bun.lock* ./
-RUN --mount=type=cache,target=/root/.bun/install/cache \
+
+RUN --mount=type=cache,id=bun-cache,target=/root/.bun/install/cache \
     bun install --frozen-lockfile
 
-# Server source (Overlord-Server/dist-clients may carry a pre-built DLL from a dev build)
+# Server source
 COPY Overlord-Server/ ./
 
-# BackstageInjection-Rust source is copied into the runtime stage too so the
-# server can recompile + re-randomize the loader export name on demand
-# (Settings -> Backstage DLL).
+# BackstageInjection-Rust source
 COPY BackstageInjection-Rust/ ./BackstageInjection-Rust/
 COPY scripts/build-backstage-dll.sh ./scripts/
 
-# Always compile the Backstage DLL from source so every image embeds a freshly
-# randomized loader export name (build.rs picks a new `x<hex>` per build).
-# Pass `--build-arg BACKSTAGE_FRESH=$(date +%s)` to defeat BuildKit layer
-# caching and force a new random name even with unchanged source.
+# Always compile the Backstage DLL from source.
 ARG BACKSTAGE_FRESH=
+
 RUN mkdir -p dist-clients && \
     chmod +x scripts/build-backstage-dll.sh && \
     echo "Building BackstageInjection DLL (fresh=${BACKSTAGE_FRESH:-default})" && \
     BACKSTAGE_CRATE_DIR=BackstageInjection-Rust BACKSTAGE_OUT_DIR=dist-clients bash scripts/build-backstage-dll.sh || \
     echo "WARNING: BackstageInjection DLL build failed; runtime can rebuild on demand (Settings -> Backstage DLL)"
 
-# Keep production build phases separate so BuildKit reports the exact slow or
-# failing phase and can cache each completed phase independently.
+# Production build phases.
 RUN bun run build:css
 RUN bun run build:web:prod
 RUN bun run vendor
@@ -140,14 +136,15 @@ RUN test "$(wc -l < ./public/index.html)" -lt 20 \
 # ============================================================
 FROM oven/bun:1.4.0-slim AS runtime
 LABEL org.opencontainers.image.source="https://github.com/doesntbreaktos/Overlord"
+
 WORKDIR /app
 
 # openssl/ca-certificates: TLS cert generation + HTTPS validation.
 # wget/tar/unzip/xz-utils: required by toolchain-manager for on-demand downloads.
 # ffmpeg: server-side remote desktop recording encoder.
 # clang/lld: Darwin CGO cross-compiler/linker used with a user-uploaded macOS SDK.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+RUN --mount=type=cache,id=runtime-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=runtime-apt-lib-cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
         openssl \
         ca-certificates \
@@ -161,7 +158,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         lld \
     && rm -rf /var/lib/apt/lists/*
 
-# Reuse Go + garble from the builder so we don't re-download.
+# Reuse Go + garble from the builder.
 COPY --from=builder /usr/local/go /usr/local/go
 COPY --from=builder /go/bin/garble /go/bin/garble
 
@@ -172,9 +169,10 @@ ENV GOMODCACHE=/app/client-build-cache/go-mod
 ENV GOTMPDIR=/app/client-build-cache/go-tmp
 ENV CARGO_TARGET_DIR=/app/client-build-cache/backstage-target
 
-# Production-only node_modules (drops tailwind, terser, postcss, typescript, ...).
+# Production-only node_modules.
 COPY Overlord-Server/package.json Overlord-Server/bun.lock* ./
-RUN --mount=type=cache,target=/root/.bun/install/cache \
+
+RUN --mount=type=cache,id=runtime-bun-cache,target=/root/.bun/install/cache \
     bun install --production --frozen-lockfile
 
 # Built runtime artifacts from the builder stage.
@@ -185,10 +183,10 @@ COPY --from=builder /app/dist-clients ./dist-clients
 # Go agent source needed at every agent build.
 COPY Overlord-Client/ ./Overlord-Client/
 COPY Overlord-Client/ /opt/overlord-client-source/
+
 RUN test -s ./Overlord-Client/third_party/nvcodec/nvEncodeAPI.h
 
-# Rust crate + build script needed for on-demand Backstage DLL recompilation
-# (re-randomized loader export) at runtime.
+# Rust crate + build script needed for on-demand Backstage DLL recompilation.
 COPY BackstageInjection-Rust/ ./BackstageInjection-Rust/
 COPY scripts/build-backstage-dll.sh ./scripts/
 COPY scripts/docker-runtime-entrypoint.sh /usr/local/bin/overlord-entrypoint
@@ -204,10 +202,9 @@ RUN mkdir -p certs data client-build-cache plugins dist-clients \
         /app/Overlord-Client \
         /app/BackstageInjection-Rust
 
-# Warm BuildKit's module cache so image rebuilds do not re-download unchanged
-# dependencies. Runtime agent builds use the writable persistent cache above.
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg/mod \
+# Warm BuildKit's module cache.
+RUN --mount=type=cache,id=runtime-go-build-cache,target=/root/.cache/go-build \
+    --mount=type=cache,id=runtime-go-mod-cache,target=/go/pkg/mod \
     cd /app/Overlord-Client && \
     GOWORK=off \
     GOMODCACHE=/go/pkg/mod \
@@ -225,5 +222,6 @@ ENV NODE_PATH=/app/node_modules
 ENV HOME=/home/bun
 
 USER bun:bun
+
 ENTRYPOINT ["/usr/local/bin/overlord-entrypoint"]
 CMD ["bun", "dist/index.js"]
