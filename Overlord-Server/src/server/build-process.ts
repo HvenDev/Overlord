@@ -720,7 +720,7 @@ export async function startBuildProcess(
 
     const serverConfig = getConfig();
     const buildAgentToken = (serverConfig.auth.agentToken || "").trim();
-    const buildTlsSpkiPins = getActiveTlsSpkiPins();
+    const buildTlsSpkiPins: string[] = [];
     if (
       String(process.env.OVERLORD_TLS_OFFLOAD || "").toLowerCase() === "true" &&
       buildTlsSpkiPins.length === 0
