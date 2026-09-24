@@ -21,7 +21,8 @@ COPY scripts/ /app/scripts/
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV DATA_DIR=/app/data
-ENV OVERLORD_ROOT=/app
+ENV OVERLORD_ROOT=/app/Overlord-Server
+ENV OVERLORD_PUBLIC_ROOT=/app/Overlord-Server/public
 
 WORKDIR /app/Overlord-Server
 
@@ -29,7 +30,7 @@ RUN bun run build
 
 RUN bun run minify
 
-RUN mkdir -p /app/data /app/Overlord-Server/dist
+RUN mkdir -p /app/data
 
 USER root
 
