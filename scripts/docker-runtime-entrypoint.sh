@@ -1,31 +1,27 @@
 #!/bin/sh
-set -eu
+set -e
 
-client_workspace=/app/Overlord-Client
-client_seed=/opt/overlord-client-source
+DATA_DIR="${OVERLORD_DATA_DIR:-/app/data}"
 
-data_dir="${DATA_DIR:-/app/data}"
-client_cache="${CLIENT_BUILD_CACHE:-/app/client-build-cache}"
-go_tmp="${GOTMPDIR:-${client_cache}/go-tmp}"
+echo "[overlord] Preparing data directory: $DATA_DIR"
 
-# Ensure runtime-writable directories exist.
-# Railway volumes are mounted after the image is built, so /app/data
-# must be prepared at container startup rather than only at build time.
-mkdir -p "$data_dir"
-mkdir -p "$go_tmp"
+# The Railway volume is mounted AFTER the image is created,
+# so permissions have to be fixed here at runtime.
+mkdir -p "$DATA_DIR"
 
-# Verify that the database/data directory is writable before starting
-# Overlord. This gives a clear startup error instead of a SQLite
-# SQLITE_CANTOPEN error later.
-if [ ! -w "$data_dir" ]; then
-  echo "ERROR: Overlord data directory is not writable: $data_dir" >&2
-  echo "The Railway volume mounted at $data_dir must be writable by the container user." >&2
-  exit 1
+chown -R bun:bun "$DATA_DIR"
+chmod 755 "$DATA_DIR"
+
+# Verify that the actual Bun user can write to the mounted volume.
+if ! su -s /bin/sh bun -c "touch '$DATA_DIR/.write-test'"; then
+    echo "ERROR: Overlord data directory is not writable: $DATA_DIR"
+    echo "The Railway volume mounted at $DATA_DIR must be writable by the container user."
+    exit 1
 fi
 
-if [ ! -s "$client_workspace/go.mod" ]; then
-  cp -a "$client_seed/." "$client_workspace/"
-fi
+rm -f "$DATA_DIR/.write-test"
 
-exec "$@"
+echo "[overlord] Data directory is writable: $DATA_DIR"
 
+# Run Overlord as the normal Bun user.
+exec su -s /bin/sh bun -c "cd /app && bun run /app/Overlord-Server/dist/index.js"
