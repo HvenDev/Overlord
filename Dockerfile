@@ -20,7 +20,6 @@ COPY scripts/ /app/scripts/
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
-ENV PORT=5173
 ENV DATA_DIR=/app/data
 ENV OVERLORD_ROOT=/app
 
@@ -34,7 +33,7 @@ RUN mkdir -p /app/data /app/Overlord-Server/dist
 
 USER root
 
-EXPOSE 5173
+EXPOSE 8080
 
 WORKDIR /app/Overlord-Server
 
