@@ -4,7 +4,7 @@ FROM oven/bun:1.4.0
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git openssl unzip zip build-essential golang-go && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl wget git openssl unzip zip build-essential golang-go && rm -rf /var/lib/apt/lists/*
 
 COPY Overlord-Server/package.json Overlord-Server/bun.lock* /app/Overlord-Server/
 
@@ -27,6 +27,7 @@ ENV OVERLORD_PUBLIC_ROOT=/app/Overlord-Server/public
 WORKDIR /app/Overlord-Server
 
 RUN go version
+RUN wget --version
 RUN bun --version
 
 RUN bun run build
