@@ -81,6 +81,28 @@ password is removed from `save.json`. Existing installations are not reset; if
 an older installation still uses `admin` / `admin`, change it manually. Keep
 `save.json` private and back it up.
 
+### Persistent storage
+
+Overlord uses SQLite for durable application records. Users, clients, sessions,
+settings, scripts, builds, notifications, screenshots, chat, and audit history
+are stored in `data/overlord.db` and remain available after a server restart.
+The database uses write-ahead logging for reliable concurrent access.
+
+State that is better represented as files is also persistent. Generated secrets
+and server configuration live under `data/`; shared files and other uploads use
+subdirectories there. TLS certificates, installed plugins, generated client
+artifacts, build caches, and the TURN secret have their own persistent storage.
+All Docker Compose variants mount named volumes for these locations, so
+recreating or updating the container does not erase them. Do not use
+`docker compose down --volumes` unless you intend to delete the saved state.
+
+For a native installation, keep the server's `data/`, `certs/`, `plugins/`,
+`dist-clients/`, and client build-cache directories on durable storage. Set
+`DATA_DIR` to an absolute path when the process can start from different working
+directories. The Settings export creates a portable backup of the SQLite
+database, secrets/configuration, certificates, plugins, and uploaded server
+state; keep that archive private because it contains credentials.
+
 Agents authenticate only through the `X-Agent-Token` header. Rebuild any
 legacy agent that still places its token in the connection URL; query-string
 agent credentials are rejected.
