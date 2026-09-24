@@ -1,4 +1,3 @@
-```dockerfile
 # syntax=docker/dockerfile:1.7
 # Overlord Server Dockerfile
 FROM oven/bun:1 AS base
@@ -143,4 +142,4 @@ USER root
 
 # Run the compiled production binary
 CMD ["./overlord-server"]
-```
+
