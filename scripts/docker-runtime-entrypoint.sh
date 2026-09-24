@@ -1,4 +1,3 @@
-```sh
 #!/bin/sh
 set -eu
 
@@ -29,4 +28,4 @@ if [ ! -s "$client_workspace/go.mod" ]; then
 fi
 
 exec "$@"
-```
+
