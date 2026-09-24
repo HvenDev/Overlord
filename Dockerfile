@@ -1,3 +1,4 @@
+```dockerfile
 # syntax=docker/dockerfile:1.7
 # Overlord Server Dockerfile
 FROM oven/bun:1 AS base
@@ -13,19 +14,20 @@ RUN apt-get update \
     musl-tools \
     gcc-aarch64-linux-gnu \
     gcc-arm-linux-gnueabihf \
-       openssl \
-       curl \
-       ca-certificates \
-       wget \
-       git \
-       unzip \
-       upx-ucl \
-       zip \
+    openssl \
+    curl \
+    ca-certificates \
+    wget \
+    git \
+    unzip \
+    upx-ucl \
+    zip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Go (latest stable version)
 ENV GO_VERSION=1.26.2
 ARG TARGETARCH
+
 RUN case "${TARGETARCH}" in \
         amd64) GO_ARCH=amd64 ;; \
         arm64) GO_ARCH=arm64 ;; \
@@ -41,14 +43,15 @@ ENV PATH="${GOPATH}/bin:${PATH}"
 ENV GOCACHE=/root/.cache/go-build
 ENV GOMODCACHE=/go/pkg/mod
 
-# Install garble for obfuscated agent builds (requires Go 1.25+)
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg/mod \
-    go install mvdan.cc/garble@latest
+# Install garble for obfuscated agent builds.
+# Cache mounts removed because Railway's Metal builder rejects
+# cache mounts without an explicit id.
+RUN go install mvdan.cc/garble@latest
 
 # Install Android NDK for Android cross-compilation
 ENV ANDROID_NDK_VERSION=r27c
 ENV ANDROID_NDK_HOME=/opt/android-ndk
+
 RUN case "${TARGETARCH}" in \
         amd64) NDK_HOST="linux-x86_64" ;; \
         arm64) NDK_HOST="linux-aarch64" ;; \
@@ -113,13 +116,14 @@ RUN mkdir -p certs public data
 
 # Build Tailwind CSS and vendor assets
 RUN bun run build:css && bun run vendor \
-    && test -s ./public/assets/tailwind.css && test -d ./public/vendor/fontawesome
+    && test -s ./public/assets/tailwind.css \
+    && test -d ./public/vendor/fontawesome
 
 # Minify public JS, CSS, and HTML assets
 RUN bun run minify
 
-# Compile a standalone production binary
-# sharp is external and remains in node_modules
+# Compile a standalone production binary.
+# sharp remains external and is kept in node_modules.
 RUN BUN_TARGET="bun-linux-x64" \
     && if [ "${TARGETARCH}" = "arm64" ]; then BUN_TARGET="bun-linux-arm64"; fi \
     && bun build --production --minify --external sharp src/index.ts \
@@ -128,7 +132,7 @@ RUN BUN_TARGET="bun-linux-x64" \
 # Expose the default port
 EXPOSE 5173
 
-# Set environment variables (can be overridden)
+# Set environment variables
 ENV PORT=5173
 ENV HOST=0.0.0.0
 ENV DATA_DIR=/app/data
@@ -136,10 +140,15 @@ ENV NODE_ENV=production
 ENV OVERLORD_ROOT=/app
 
 # Railway mounts /app/data after the image is built.
-# The mounted volume may not be writable by the default "bun"
-# user, so run the production server as root.
+# The mounted volume can be owned by root, while the oven/bun
+# image normally runs as the non-root "bun" user.
+#
+# Running the final server as root allows SQLite to create/write:
+# /app/data/overlord.db
+#
+# No separate entrypoint script is required.
 USER root
 
 # Run the compiled production binary
 CMD ["./overlord-server"]
-
+```
